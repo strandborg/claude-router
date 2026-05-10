@@ -1,6 +1,8 @@
 # anthropic-quota-proxy
 
-A local HTTP proxy that makes Claude aware of its own usage limits.
+A local HTTP proxy that makes Claude Code aware of its own usage limits.
+
+**Works with Claude Code (CLI) only.** The web chat and browser extension make requests directly from Anthropic's infrastructure — they don't go through a local proxy and can't use this.
 
 Claude Code (Max plan) shows usage bars for the 5-hour and 7-day quota windows in the UI. The model itself has no access to those values — there's no API, no tool, no hook that exposes them during a conversation. This proxy sits between Claude Code and `api.anthropic.com`, captures the rate-limit headers on every response, and writes a one-line status file that Claude can read any time.
 
