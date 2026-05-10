@@ -1,0 +1,5 @@
+tools/nssm.exe
+proxy.log
+proxy-error.log
+node_modules/
+*.pid
