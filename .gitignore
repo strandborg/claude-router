@@ -3,3 +3,6 @@ proxy.log
 proxy-error.log
 node_modules/
 *.pid
+
+# OMC / Claude Code workflow artifacts and runtime state (kept local)
+.omc/

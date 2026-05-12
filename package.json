@@ -1,0 +1,14 @@
+{
+  "name": "claude-quota-proxy",
+  "version": "0.2.0",
+  "description": "Transparent proxy for Claude Code with LiteLLM fallback when quota is near limits",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js",
+    "test": "node --test tests/smoke.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC"
+}
