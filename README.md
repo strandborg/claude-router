@@ -2,6 +2,8 @@
 
 A local HTTP router for Claude Code. Routes each request to either `api.anthropic.com` or a local LiteLLM gateway based on the model name and current Anthropic quota state. As a side effect, captures `anthropic-ratelimit-*` response headers and writes a one-line status file at `~/.claude/usage-status.md` so Claude can read its own quota state.
 
+> Forked from [InertiaUK/claude-quota-proxy](https://github.com/InertiaUK/claude-quota-proxy), which provided the original transparent-proxy implementation and usage-file design. LiteLLM fallback, multi-model routing, and the rename are downstream additions.
+
 **Works with Claude Code (CLI) only.** The web chat and browser extension talk to Anthropic's infrastructure directly — they don't route through a local proxy.
 
 ## What it does
@@ -387,3 +389,7 @@ claude-router/
   proxy.log               stdout (1 MB rotation via NSSM)
   proxy-error.log         stderr
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE). Originally forked from [InertiaUK/claude-quota-proxy](https://github.com/InertiaUK/claude-quota-proxy).
