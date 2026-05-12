@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 
-$ServiceName = 'AnthropicQuotaProxy'
+$ServiceName = 'ClaudeRouter'
 $ProjectDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ToolsDir    = Join-Path $ProjectDir 'tools'
 $NssmPath    = Join-Path $ToolsDir 'nssm.exe'
@@ -78,8 +78,8 @@ if ($existing) {
 Write-Host "Installing service..."
 Invoke-Nssm @('install', $ServiceName, $NodePath)
 Invoke-Nssm @('set', $ServiceName, 'AppParameters', "`"$ProxyScript`"")
-Invoke-Nssm @('set', $ServiceName, 'DisplayName',  'Anthropic Quota Proxy')
-Invoke-Nssm @('set', $ServiceName, 'Description',  'Intercepts Claude Code API responses to capture rate-limit utilisation headers and write usage-status.md')
+Invoke-Nssm @('set', $ServiceName, 'DisplayName',  'Claude Router')
+Invoke-Nssm @('set', $ServiceName, 'Description',  'Routes Claude Code traffic between api.anthropic.com and a local LiteLLM gateway based on model and quota state, and writes a usage-status.md file Claude can read.')
 Invoke-Nssm @('set', $ServiceName, 'Start',        'SERVICE_AUTO_START')
 Invoke-Nssm @('set', $ServiceName, 'AppDirectory', $ProjectDir)
 Invoke-Nssm @('set', $ServiceName, 'AppStdout',    (Join-Path $ProjectDir 'proxy.log'))

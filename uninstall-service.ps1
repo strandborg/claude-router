@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 
-$ServiceName = 'AnthropicQuotaProxy'
+$ServiceName = 'ClaudeRouter'
 $ProjectDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $NssmPath    = Join-Path $ProjectDir 'tools\nssm.exe'
 

@@ -1,18 +1,18 @@
-# anthropic-quota-proxy
+# claude-router
 
-A local HTTP proxy that sits between Claude Code and `api.anthropic.com`. It captures rate-limit headers on every response so Claude can read its own quota state, and can optionally redirect requests to a LiteLLM gateway when quota runs low or when a non-Anthropic model is requested.
+A local HTTP router for Claude Code. Routes each request to either `api.anthropic.com` or a local LiteLLM gateway based on the model name and current Anthropic quota state. As a side effect, captures `anthropic-ratelimit-*` response headers and writes a one-line status file at `~/.claude/usage-status.md` so Claude can read its own quota state.
 
 **Works with Claude Code (CLI) only.** The web chat and browser extension talk to Anthropic's infrastructure directly — they don't route through a local proxy.
 
 ## What it does
 
-The proxy has two capabilities that can be used independently:
+The router has two capabilities that can be used independently:
 
 1. **Quota visibility** — always on. Forwards every request to Anthropic unchanged, scrapes the `anthropic-ratelimit-*` response headers, and writes a one-line status file at `~/.claude/usage-status.md`. Claude reads that file to know how close it is to the 5-hour, 7-day, and overage limits.
 
 2. **LiteLLM fallback** — opt-in via `LITELLM_URL`. When any utilization window hits a configured threshold, `claude-*` requests are redirected to a local LiteLLM instance with the body's `model` field rewritten to a tier-matched substitute (`opus`, `sonnet`, `haiku`). Non-Anthropic models (`gpt-*`, `gemini-*`, etc.) always go to LiteLLM regardless of quota, with the body forwarded as-is.
 
-If `LITELLM_URL` is unset the proxy is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
+If `LITELLM_URL` is unset, claude-router is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
 
 ## How it works
 
@@ -37,12 +37,12 @@ Claude Code
 api.anthropic.com (HTTPS)   localhost:4000 (LiteLLM, optional)
 ```
 
-Claude Code honors the `ANTHROPIC_BASE_URL` environment variable. Point it at the proxy (`http://127.0.0.1:4080`) and all API traffic routes through it. The proxy is a single Node.js script with zero npm dependencies. It runs as a Windows service (via NSSM), launchd agent (macOS), or systemd user unit (Linux).
+Claude Code honors the `ANTHROPIC_BASE_URL` environment variable. Point it at the router (`http://127.0.0.1:4080`) and all API traffic flows through it. claude-router is a single Node.js script with zero npm dependencies. It runs as a Windows service (via NSSM), launchd agent (macOS), or systemd user unit (Linux).
 
 ## Quick start
 
 1. Set `ANTHROPIC_BASE_URL=http://127.0.0.1:4080` in your environment.
-2. Install the proxy as a background service (see [Installation](#installation)).
+2. Install claude-router as a background service (see [Installation](#installation)).
 3. (Optional) Set `LITELLM_URL` and `LITELLM_API_KEY` to enable fallback to a LiteLLM gateway.
 4. Restart Claude Code. Ask "what's my current quota usage?" — Claude will read `~/.claude/usage-status.md`.
 
@@ -54,14 +54,14 @@ Requires Node.js and an admin PowerShell session. NSSM is downloaded automatical
 
 ```powershell
 # Run as Administrator
-& "path\to\anthropic-quota-proxy\install-service.ps1"
+& "path\to\claude-router\install-service.ps1"
 ```
 
 The script:
 - Validates Node.js is on PATH.
 - Resolves your user profile path.
 - Downloads NSSM to `./tools/nssm.exe`.
-- Registers `AnthropicQuotaProxy` as an auto-starting Windows service running under `LocalSystem`.
+- Registers `ClaudeRouter` as an auto-starting Windows service running under `LocalSystem`.
 - Sets `ANTHROPIC_BASE_URL=http://127.0.0.1:4080` as a user environment variable.
 
 Close all Claude Code windows and open a fresh one — existing sessions inherited their env before the install.
@@ -70,12 +70,12 @@ To uninstall:
 
 ```powershell
 # Run as Administrator
-& "path\to\anthropic-quota-proxy\uninstall-service.ps1"
+& "path\to\claude-router\uninstall-service.ps1"
 ```
 
 ### macOS (launchd)
 
-Create `~/Library/LaunchAgents/com.anthropic-quota-proxy.plist`:
+Create `~/Library/LaunchAgents/com.claude-router.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -83,25 +83,25 @@ Create `~/Library/LaunchAgents/com.anthropic-quota-proxy.plist`:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.anthropic-quota-proxy</string>
+    <string>com.claude-router</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/node</string>
-        <string>/path/to/anthropic-quota-proxy/proxy.js</string>
+        <string>/path/to/claude-router/proxy.js</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key>
-    <string>/path/to/anthropic-quota-proxy/proxy.log</string>
+    <string>/path/to/claude-router/proxy.log</string>
     <key>StandardErrorPath</key>
-    <string>/path/to/anthropic-quota-proxy/proxy-error.log</string>
+    <string>/path/to/claude-router/proxy-error.log</string>
     <!-- Add <key>EnvironmentVariables</key><dict>…</dict> for LITELLM_URL etc. -->
 </dict>
 </plist>
 ```
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.anthropic-quota-proxy.plist
+launchctl load ~/Library/LaunchAgents/com.claude-router.plist
 ```
 
 Add to `~/.zshrc` or `~/.bash_profile`:
@@ -112,29 +112,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:4080
 
 ### Linux (systemd user unit)
 
-Create `~/.config/systemd/user/anthropic-quota-proxy.service`:
+Create `~/.config/systemd/user/claude-router.service`:
 
 ```ini
 [Unit]
-Description=Anthropic Quota Proxy
+Description=Claude Router
 
 [Service]
-ExecStart=/usr/bin/node /path/to/anthropic-quota-proxy/proxy.js
+ExecStart=/usr/bin/node /path/to/claude-router/proxy.js
 Environment=CLAUDE_USAGE_FILE=%h/.claude/usage-status.md
 # Optional — enable LiteLLM fallback:
 # Environment=LITELLM_URL=http://localhost:4000
 # Environment=LITELLM_API_KEY=sk-...
 Restart=always
-StandardOutput=append:/path/to/anthropic-quota-proxy/proxy.log
-StandardError=append:/path/to/anthropic-quota-proxy/proxy-error.log
+StandardOutput=append:/path/to/claude-router/proxy.log
+StandardError=append:/path/to/claude-router/proxy-error.log
 
 [Install]
 WantedBy=default.target
 ```
 
 ```bash
-systemctl --user enable anthropic-quota-proxy
-systemctl --user start anthropic-quota-proxy
+systemctl --user enable claude-router
+systemctl --user start claude-router
 ```
 
 Add to `~/.bashrc` or `~/.zshrc`:
@@ -145,7 +145,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:4080
 
 ## Configuration
 
-All settings are environment variables. Only `ANTHROPIC_BASE_URL` (on the Claude Code side) is required.
+All claude-router settings are environment variables. Only `ANTHROPIC_BASE_URL` (on the Claude Code side) is required.
 
 ### Quota visibility (always on)
 
@@ -161,7 +161,7 @@ The fallback feature activates only when `LITELLM_URL` is set. All other variabl
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `LITELLM_URL` | LiteLLM base URL, e.g. `http://localhost:4000`. **Feature gate** — unset = pure passthrough. | unset |
+| `LITELLM_URL` | LiteLLM base URL, e.g. `http://localhost:4000`. **Feature gate** — unset disables the LiteLLM half of the router. | unset |
 | `LITELLM_API_KEY` | Bearer token sent on every LiteLLM-bound request. Required when `LITELLM_URL` is set. | unset |
 | `LITELLM_FALLBACK_OPUS` | Model name substituted into the body when a `claude-opus-*` request is redirected. Empty string disables (causes 500 on opus redirects). | `claude-opus-4-7` |
 | `LITELLM_FALLBACK_SONNET` | Same, for `claude-sonnet-*`. | `claude-sonnet-4-6` |
@@ -205,7 +205,7 @@ Endpoints other than `/v1/messages` and `/v1/messages/count_tokens` always go to
 
 ### Background probe
 
-While in redirect mode no Anthropic responses are arriving, so quota state cannot update from live traffic. The proxy fires a minimal `POST /v1/messages/count_tokens` against Anthropic every `PROBE_INTERVAL_MS`:
+While in redirect mode no Anthropic responses are arriving, so quota state cannot update from live traffic. claude-router fires a minimal `POST /v1/messages/count_tokens` against Anthropic every `PROBE_INTERVAL_MS`:
 
 - Uses `ANTHROPIC_API_KEY_FOR_PROBES` if set; otherwise the most recently captured client `authorization` / `x-api-key` header.
 - If no client auth has been captured yet and no probe key is configured, the tick is skipped.
@@ -310,18 +310,18 @@ On macOS/Linux, swap the command for a shell equivalent reading `~/.claude/usage
 
 When `LITELLM_URL` is set, `/v1/messages` and `/v1/messages/count_tokens` request bodies are buffered up to `MAX_BUFFER_BYTES` (10 MB default) so the model field can be inspected. Oversized bodies return 413 before any upstream call. Streaming-response bodies (from either upstream) are not buffered — they are piped straight back to the client.
 
-If `LITELLM_URL` is unset, no body buffering occurs at all and the proxy is a pure pipe.
+If `LITELLM_URL` is unset, no body buffering occurs at all and the router is a pure pipe.
 
 ### Body parse failures
 
-If `/v1/messages` is called with a malformed JSON body, the request is forwarded to Anthropic with the original bytes intact and logged as `dispatch: anthropic reason=parse-failed-fail-safe`. This is a deliberate fail-safe: routing a parse failure to LiteLLM would change semantics for a request the proxy doesn't understand.
+If `/v1/messages` is called with a malformed JSON body, the request is forwarded to Anthropic with the original bytes intact and logged as `dispatch: anthropic reason=parse-failed-fail-safe`. This is a deliberate fail-safe: routing a parse failure to LiteLLM would change semantics for a request claude-router doesn't understand.
 
 ### Auth-cache threat model
 
 When `ANTHROPIC_API_KEY_FOR_PROBES` is unset, the background probe reuses the cached client `authorization` / `x-api-key` header. This cache is:
 
 - In-memory only — never written to disk.
-- Lives for the proxy process lifetime.
+- Lives for the router process lifetime.
 - Used exclusively for probe calls to `api.anthropic.com:443` over TLS.
 - Never logged. Never sent to LiteLLM.
 
@@ -329,12 +329,12 @@ For security-conscious deployments, set `ANTHROPIC_API_KEY_FOR_PROBES` to a dedi
 
 ### Single-tenancy
 
-This proxy assumes **one Anthropic account per running instance**. Sharing one proxy across multiple Anthropic accounts causes:
+claude-router assumes **one Anthropic account per running instance**. Sharing one router across multiple Anthropic accounts causes:
 
 - Quota-state pollution (utilization is aggregated across accounts).
 - Probe-credential cross-contamination (the cached auth may not belong to the account being probed).
 
-Run a separate proxy on a separate port for each Anthropic account.
+Run a separate router on a separate port for each Anthropic account.
 
 ## Rate-limit headers reference
 
@@ -353,13 +353,13 @@ All headers observed on a Claude Max plan account (confirmed 2026-05-10):
 
 ## Design notes
 
-**Why HTTP for the local connection?** `ANTHROPIC_BASE_URL=http://…` makes the SDK speak plain HTTP to the proxy — no localhost certificate management. The proxy makes a separate HTTPS connection to the real API.
+**Why HTTP for the local connection?** `ANTHROPIC_BASE_URL=http://…` makes the SDK speak plain HTTP to claude-router — no localhost certificate management. The router makes a separate HTTPS connection to the real API.
 
 **Why LocalSystem for the Windows service?** Avoids storing user credentials in the service config. The install script bakes your actual home path into `CLAUDE_USAGE_FILE` at install time instead.
 
 **Why NSSM?** One binary, no npm dependencies, handles log rotation, clean install/uninstall. `node-windows` downloads its own binary at install time and requires npm — same outcome with more moving parts.
 
-**Why fail-safe on parse failure?** A malformed body the proxy can't read might still be valid to Anthropic (e.g. SDK version skew) but is unlikely to make sense to a LiteLLM gateway with rewritten routing. Defaulting to Anthropic preserves Claude Code's expected behavior for requests the proxy doesn't understand.
+**Why fail-safe on parse failure?** A malformed body claude-router can't read might still be valid to Anthropic (e.g. SDK version skew) but is unlikely to make sense to a LiteLLM gateway with rewritten routing. Defaulting to Anthropic preserves Claude Code's expected behavior for requests the router doesn't understand.
 
 **Why probe with `count_tokens`?** It's the cheapest Anthropic endpoint that still returns the unified rate-limit headers. Minimal token cost while redirected.
 
@@ -376,8 +376,8 @@ Tests use Node's built-in `node:test` (Node ≥ 18). Zero npm dependencies. Loca
 ## Files
 
 ```
-anthropic-quota-proxy/
-  proxy.js                zero-dependency Node.js proxy
+claude-router/
+  proxy.js                zero-dependency Node.js router
   install-service.ps1     Windows service installer (run as admin)
   uninstall-service.ps1   Windows service uninstaller (run as admin)
   tests/

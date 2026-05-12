@@ -1,7 +1,7 @@
 {
-  "name": "claude-quota-proxy",
+  "name": "claude-router",
   "version": "0.2.0",
-  "description": "Transparent proxy for Claude Code with LiteLLM fallback when quota is near limits",
+  "description": "Local router for Claude Code that switches between Anthropic and a LiteLLM gateway based on model and quota state",
   "main": "proxy.js",
   "scripts": {
     "start": "node proxy.js",

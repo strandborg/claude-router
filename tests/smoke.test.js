@@ -1,6 +1,6 @@
 'use strict';
 
-// Smoke tests for claude-quota-proxy using Node's built-in node:test.
+// Smoke tests for claude-router using Node's built-in node:test.
 // NO external test framework — node:test only (Node >= 18).
 // All network calls are intercepted by local mock servers on ephemeral ports.
 //
