@@ -1,44 +1,52 @@
 # anthropic-quota-proxy
 
-A local HTTP proxy that makes Claude Code aware of its own usage limits.
+A local HTTP proxy that sits between Claude Code and `api.anthropic.com`. It captures rate-limit headers on every response so Claude can read its own quota state, and can optionally redirect requests to a LiteLLM gateway when quota runs low or when a non-Anthropic model is requested.
 
-**Works with Claude Code (CLI) only.** The web chat and browser extension make requests directly from Anthropic's infrastructure — they don't go through a local proxy and can't use this.
+**Works with Claude Code (CLI) only.** The web chat and browser extension talk to Anthropic's infrastructure directly — they don't route through a local proxy.
 
-Claude Code (Max plan) shows usage bars for the 5-hour and 7-day quota windows in the UI. The model itself has no access to those values — there's no API, no tool, no hook that exposes them during a conversation. This proxy sits between Claude Code and `api.anthropic.com`, captures the rate-limit headers on every response, and writes a one-line status file that Claude can read any time.
+## What it does
+
+The proxy has two capabilities that can be used independently:
+
+1. **Quota visibility** — always on. Forwards every request to Anthropic unchanged, scrapes the `anthropic-ratelimit-*` response headers, and writes a one-line status file at `~/.claude/usage-status.md`. Claude reads that file to know how close it is to the 5-hour, 7-day, and overage limits.
+
+2. **LiteLLM fallback** — opt-in via `LITELLM_URL`. When any utilization window hits a configured threshold, `claude-*` requests are redirected to a local LiteLLM instance with the body's `model` field rewritten to a tier-matched substitute (`opus`, `sonnet`, `haiku`). Non-Anthropic models (`gpt-*`, `gemini-*`, etc.) always go to LiteLLM regardless of quota, with the body forwarded as-is.
+
+If `LITELLM_URL` is unset the proxy is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
 
 ## How it works
 
-Claude Code respects the `ANTHROPIC_BASE_URL` environment variable. Set it to `http://127.0.0.1:4080` and all API traffic routes through the proxy. The proxy forwards every request unchanged, reads the rate-limit response headers, and writes `~/.claude/usage-status.md`. Claude reads that file when it needs to know the current quota state.
-
 ```
-Claude Code → HTTP → 127.0.0.1:4080 (proxy) → HTTPS → api.anthropic.com
-                              ↓
-                    captures response headers
-                              ↓
-                ~/.claude/usage-status.md
+Claude Code
+   │
+   │ ANTHROPIC_BASE_URL=http://127.0.0.1:4080
+   ▼
+┌─────────────────────────────────────────────────────┐
+│ proxy.js (single Node.js script, zero npm deps)     │
+│                                                     │
+│  1. classify request                                │
+│       claude-*  → Anthropic   (or LiteLLM if over)  │
+│       other     → LiteLLM     (always)              │
+│                                                     │
+│  2. forward, read response headers                  │
+│  3. write ~/.claude/usage-status.md                 │
+│  4. probe Anthropic every 5min while redirected     │
+└─────────────────────────────────────────────────────┘
+   │                          │
+   ▼                          ▼
+api.anthropic.com (HTTPS)   localhost:4000 (LiteLLM, optional)
 ```
 
-The proxy is a single Node.js script with zero npm dependencies. On Windows it runs as a Windows service via [NSSM](https://nssm.cc). On macOS and Linux the same script runs via launchd or systemd.
+Claude Code honors the `ANTHROPIC_BASE_URL` environment variable. Point it at the proxy (`http://127.0.0.1:4080`) and all API traffic routes through it. The proxy is a single Node.js script with zero npm dependencies. It runs as a Windows service (via NSSM), launchd agent (macOS), or systemd user unit (Linux).
 
-## Output
+## Quick start
 
-A single line in `~/.claude/usage-status.md`, updated on every inference response:
+1. Set `ANTHROPIC_BASE_URL=http://127.0.0.1:4080` in your environment.
+2. Install the proxy as a background service (see [Installation](#installation)).
+3. (Optional) Set `LITELLM_URL` and `LITELLM_API_KEY` to enable fallback to a LiteLLM gateway.
+4. Restart Claude Code. Ask "what's my current quota usage?" — Claude will read `~/.claude/usage-status.md`.
 
-```
-5h=9% 7d=99%! overage=0% bottleneck=seven_day (10/05/2026, 16:19:04)
-```
-
-`!` means that window has an `allowed_warning` status — you're close to the limit.
-
-The three pools:
-
-- **5h** — rolling 5-hour window
-- **7d** — rolling 7-day window  
-- **overage** — paid burst pool, available once the 7d pool is exhausted
-
-One unified pool covers all models. There is no separate Sonnet or Opus pool despite the Claude Code UI showing individual model bars.
-
-## Setup
+## Installation
 
 ### Windows
 
@@ -46,23 +54,28 @@ Requires Node.js and an admin PowerShell session. NSSM is downloaded automatical
 
 ```powershell
 # Run as Administrator
-& "path\to\usage-proxy\install-service.ps1"
+& "path\to\anthropic-quota-proxy\install-service.ps1"
 ```
 
-The script validates Node.js, confirms your user profile path, downloads NSSM to `./tools/nssm.exe`, registers `AnthropicQuotaProxy` as an auto-starting Windows service, and sets `ANTHROPIC_BASE_URL=http://127.0.0.1:4080` as a user environment variable.
+The script:
+- Validates Node.js is on PATH.
+- Resolves your user profile path.
+- Downloads NSSM to `./tools/nssm.exe`.
+- Registers `AnthropicQuotaProxy` as an auto-starting Windows service running under `LocalSystem`.
+- Sets `ANTHROPIC_BASE_URL=http://127.0.0.1:4080` as a user environment variable.
 
-After it finishes, close all Claude Code windows and open a fresh one. Existing sessions won't route through the proxy — they inherited environment variables before the change.
+Close all Claude Code windows and open a fresh one — existing sessions inherited their env before the install.
 
 To uninstall:
 
 ```powershell
 # Run as Administrator
-& "path\to\usage-proxy\uninstall-service.ps1"
+& "path\to\anthropic-quota-proxy\uninstall-service.ps1"
 ```
 
-### macOS
+### macOS (launchd)
 
-Create a launchd plist at `~/Library/LaunchAgents/com.anthropic-quota-proxy.plist`:
+Create `~/Library/LaunchAgents/com.anthropic-quota-proxy.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -74,16 +87,15 @@ Create a launchd plist at `~/Library/LaunchAgents/com.anthropic-quota-proxy.plis
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/node</string>
-        <string>/path/to/usage-proxy/proxy.js</string>
+        <string>/path/to/anthropic-quota-proxy/proxy.js</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
     <key>StandardOutPath</key>
-    <string>/path/to/usage-proxy/proxy.log</string>
+    <string>/path/to/anthropic-quota-proxy/proxy.log</string>
     <key>StandardErrorPath</key>
-    <string>/path/to/usage-proxy/proxy-error.log</string>
+    <string>/path/to/anthropic-quota-proxy/proxy-error.log</string>
+    <!-- Add <key>EnvironmentVariables</key><dict>…</dict> for LITELLM_URL etc. -->
 </dict>
 </plist>
 ```
@@ -98,7 +110,7 @@ Add to `~/.zshrc` or `~/.bash_profile`:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:4080
 ```
 
-### Linux
+### Linux (systemd user unit)
 
 Create `~/.config/systemd/user/anthropic-quota-proxy.service`:
 
@@ -107,11 +119,14 @@ Create `~/.config/systemd/user/anthropic-quota-proxy.service`:
 Description=Anthropic Quota Proxy
 
 [Service]
-ExecStart=/usr/bin/node /path/to/usage-proxy/proxy.js
+ExecStart=/usr/bin/node /path/to/anthropic-quota-proxy/proxy.js
 Environment=CLAUDE_USAGE_FILE=%h/.claude/usage-status.md
+# Optional — enable LiteLLM fallback:
+# Environment=LITELLM_URL=http://localhost:4000
+# Environment=LITELLM_API_KEY=sk-...
 Restart=always
-StandardOutput=append:/path/to/usage-proxy/proxy.log
-StandardError=append:/path/to/usage-proxy/proxy-error.log
+StandardOutput=append:/path/to/anthropic-quota-proxy/proxy.log
+StandardError=append:/path/to/anthropic-quota-proxy/proxy-error.log
 
 [Install]
 WantedBy=default.target
@@ -128,19 +143,106 @@ Add to `~/.bashrc` or `~/.zshrc`:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:4080
 ```
 
-## Asking Claude for current usage
+## Configuration
 
-Once the proxy is running, Claude can read the status file directly. Ask it:
+All settings are environment variables. Only `ANTHROPIC_BASE_URL` (on the Claude Code side) is required.
 
-> "What's my current quota usage?"
+### Quota visibility (always on)
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `CLAUDE_USAGE_FILE` | Path to the usage status file Claude reads. | `~/.claude/usage-status.md` |
+| `PORT` | TCP port the proxy listens on. | `4080` |
+| `BIND` | Bind address. | `127.0.0.1` |
+
+### LiteLLM fallback (opt-in)
+
+The fallback feature activates only when `LITELLM_URL` is set. All other variables in this table are no-ops while it is unset.
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LITELLM_URL` | LiteLLM base URL, e.g. `http://localhost:4000`. **Feature gate** — unset = pure passthrough. | unset |
+| `LITELLM_API_KEY` | Bearer token sent on every LiteLLM-bound request. Required when `LITELLM_URL` is set. | unset |
+| `LITELLM_FALLBACK_OPUS` | Model name substituted into the body when a `claude-opus-*` request is redirected. Empty string disables (causes 500 on opus redirects). | `claude-opus-4-7` |
+| `LITELLM_FALLBACK_SONNET` | Same, for `claude-sonnet-*`. | `claude-sonnet-4-6` |
+| `LITELLM_FALLBACK_HAIKU` | Same, for `claude-haiku-*`. | `claude-haiku-4-5` |
+| `REDIRECT_AT_5H_PCT` | 5-hour utilization threshold (integer 1–100). | `90` |
+| `REDIRECT_AT_7D_PCT` | 7-day utilization threshold. | `90` |
+| `REDIRECT_AT_OVERAGE_PCT` | Overage utilization threshold. | `80` |
+| `HYSTERESIS_PCT` | How far below the threshold every window must drop before switching back to Anthropic. Prevents oscillation. | `5` |
+| `PROBE_INTERVAL_MS` | Background probe period while in redirect mode (ms). | `300000` (5 min) |
+| `PROBE_MODEL` | Model used in probe `count_tokens` requests. | `claude-haiku-4-5` |
+| `ANTHROPIC_API_KEY_FOR_PROBES` | Dedicated Anthropic key for probe requests. When set, the cached client bearer is never used for probes. | unset |
+| `MAX_BUFFER_BYTES` | Maximum body size buffered on `/v1/messages` and `/v1/messages/count_tokens`. Requests exceeding this return 413. | `10485760` (10 MB) |
+| `ANTHROPIC_HOST_OVERRIDE` | Override Anthropic target as `host[:port]`. **Test seam — not for production.** | `api.anthropic.com:443` |
+
+## Routing reference
+
+### Dispatch rules
+
+| Request body `model` | Quota state | Upstream | Body rewritten? |
+|---|---|---|---|
+| `claude-opus-*` | below threshold | Anthropic | no |
+| `claude-sonnet-*` | below threshold | Anthropic | no |
+| `claude-haiku-*` | below threshold | Anthropic | no |
+| `claude-opus-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_OPUS` |
+| `claude-sonnet-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_SONNET` |
+| `claude-haiku-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_HAIKU` |
+| `claude-*` (unknown tier) | at/above threshold | LiteLLM | no (forwarded as-is) |
+| anything else (`gpt-*`, `gemini-*`, …) | any | LiteLLM | no |
+| body unparseable / missing model | any | Anthropic (fail-safe) | no |
+
+Tier classification is by case-insensitive substring match: a model name containing `opus` is opus-tier, `sonnet` is sonnet-tier, `haiku` is haiku-tier. Anything else starting with `claude-` is "unknown tier".
+
+Endpoints other than `/v1/messages` and `/v1/messages/count_tokens` always go to Anthropic without body inspection.
+
+### Redirect engagement
+
+- **Redirect engages** when **any one** of the three utilization windows reaches its threshold.
+- **Switch-back requires all three** windows to drop below `threshold − HYSTERESIS_PCT` (default 5 points).
+- Each mode transition logs a line: `[proxy] mode transition: anthropic -> litellm (5h=…%, 7d=…%, overage=…%)`.
+- Each dispatched request logs a line: `[proxy] dispatch: anthropic|litellm reason=… model=… [rewrite=…]`.
+
+### Background probe
+
+While in redirect mode no Anthropic responses are arriving, so quota state cannot update from live traffic. The proxy fires a minimal `POST /v1/messages/count_tokens` against Anthropic every `PROBE_INTERVAL_MS`:
+
+- Uses `ANTHROPIC_API_KEY_FOR_PROBES` if set; otherwise the most recently captured client `authorization` / `x-api-key` header.
+- If no client auth has been captured yet and no probe key is configured, the tick is skipped.
+- After three consecutive probe failures (e.g. 401), the interval doubles up to a 1-hour cap.
+- When a client request arrives with a different auth value (key rotation), backoff is reset and the probe fires at the original cadence.
+
+The probe response carries fresh `anthropic-ratelimit-*` headers, which update in-memory quota state and may trigger a switch back to Anthropic.
+
+## Usage output
+
+`~/.claude/usage-status.md` is overwritten on every Anthropic response (and every probe response while redirected):
+
+```
+5h=9% 7d=99%! overage=0% bottleneck=seven_day (10/05/2026, 16:19:04)
+```
+
+- **5h** — rolling 5-hour window utilization
+- **7d** — rolling 7-day window utilization
+- **overage** — paid burst pool (available once 7d is exhausted)
+- **`!`** suffix — that window returned an `allowed_warning` status
+- **bottleneck** — which window Anthropic currently considers binding
+
+One unified pool covers all models. There is no separate Sonnet or Opus pool despite the Claude Code UI showing individual bars.
+
+### Letting Claude read it
+
+Once the proxy is running, ask Claude:
+
+> What's my current quota usage?
 
 Claude reads `~/.claude/usage-status.md` and reports the values. The file is updated on every request so it's always current.
 
-## CLAUDE.md rules
+### CLAUDE.md rules
 
-Add rules to your global `~/.claude/CLAUDE.md` to make Claude behave differently based on quota state. A few options depending on how much you want it involved.
+Add a rule to your global `~/.claude/CLAUDE.md` so Claude adjusts behavior based on quota state. Examples ranked from light to strict:
 
-### Report at session start
+**Report at session start**
 
 ```markdown
 ## Quota awareness
@@ -148,7 +250,7 @@ At the start of each session, read `~/.claude/usage-status.md` and report the 5h
 If either shows `!`, flag it.
 ```
 
-### Warn before large tasks
+**Warn before large tasks**
 
 ```markdown
 ## Quota awareness
@@ -157,7 +259,7 @@ read `~/.claude/usage-status.md`. If 7d usage is above 80%, say so and confirm b
 If 7d is above 95%, ask whether to continue or defer until the window resets.
 ```
 
-### Adjust approach by usage level
+**Adjust approach by usage level**
 
 ```markdown
 ## Quota awareness
@@ -169,7 +271,7 @@ Read `~/.claude/usage-status.md` at the start of each session.
 - `!` on any window: mention it before starting multi-step tasks
 ```
 
-### Hard stop near limit
+**Hard stop near limit**
 
 ```markdown
 ## Quota awareness
@@ -178,9 +280,9 @@ do not start new implementation tasks. Explain the quota state and suggest resum
 or switching to a lighter approach.
 ```
 
-### Auto-inject via hook (no manual reads needed)
+### Auto-inject via hook
 
-Instead of asking Claude to read the file, inject it into every prompt automatically. Add to your Claude Code `settings.json`:
+Instead of asking Claude to read the file, inject it into every prompt via a `UserPromptSubmit` hook. Add to your Claude Code `settings.json`:
 
 ```json
 {
@@ -200,7 +302,39 @@ Instead of asking Claude to read the file, inject it into every prompt automatic
 }
 ```
 
-On macOS/Linux, replace the command with a shell equivalent reading `~/.claude/usage-status.md`.
+On macOS/Linux, swap the command for a shell equivalent reading `~/.claude/usage-status.md`.
+
+## Operational notes
+
+### Buffering
+
+When `LITELLM_URL` is set, `/v1/messages` and `/v1/messages/count_tokens` request bodies are buffered up to `MAX_BUFFER_BYTES` (10 MB default) so the model field can be inspected. Oversized bodies return 413 before any upstream call. Streaming-response bodies (from either upstream) are not buffered — they are piped straight back to the client.
+
+If `LITELLM_URL` is unset, no body buffering occurs at all and the proxy is a pure pipe.
+
+### Body parse failures
+
+If `/v1/messages` is called with a malformed JSON body, the request is forwarded to Anthropic with the original bytes intact and logged as `dispatch: anthropic reason=parse-failed-fail-safe`. This is a deliberate fail-safe: routing a parse failure to LiteLLM would change semantics for a request the proxy doesn't understand.
+
+### Auth-cache threat model
+
+When `ANTHROPIC_API_KEY_FOR_PROBES` is unset, the background probe reuses the cached client `authorization` / `x-api-key` header. This cache is:
+
+- In-memory only — never written to disk.
+- Lives for the proxy process lifetime.
+- Used exclusively for probe calls to `api.anthropic.com:443` over TLS.
+- Never logged. Never sent to LiteLLM.
+
+For security-conscious deployments, set `ANTHROPIC_API_KEY_FOR_PROBES` to a dedicated probe-only Anthropic key. This eliminates the cached-bearer scope entirely.
+
+### Single-tenancy
+
+This proxy assumes **one Anthropic account per running instance**. Sharing one proxy across multiple Anthropic accounts causes:
+
+- Quota-state pollution (utilization is aggregated across accounts).
+- Probe-credential cross-contamination (the cached auth may not belong to the account being probed).
+
+Run a separate proxy on a separate port for each Anthropic account.
 
 ## Rate-limit headers reference
 
@@ -219,16 +353,30 @@ All headers observed on a Claude Max plan account (confirmed 2026-05-10):
 
 ## Design notes
 
-**Why HTTP not HTTPS for the local connection?** Setting `ANTHROPIC_BASE_URL=http://` makes the SDK connect to the proxy over plain HTTP — no certificate management needed for localhost. The proxy makes a separate HTTPS connection to the real API.
+**Why HTTP for the local connection?** `ANTHROPIC_BASE_URL=http://…` makes the SDK speak plain HTTP to the proxy — no localhost certificate management. The proxy makes a separate HTTPS connection to the real API.
 
 **Why LocalSystem for the Windows service?** Avoids storing user credentials in the service config. The install script bakes your actual home path into `CLAUDE_USAGE_FILE` at install time instead.
 
-**Why NSSM?** One binary, no npm dependencies, handles log rotation, clean install/remove. The alternative (`node-windows`) downloads a binary itself during install and requires npm — same end result with more moving parts.
+**Why NSSM?** One binary, no npm dependencies, handles log rotation, clean install/uninstall. `node-windows` downloads its own binary at install time and requires npm — same outcome with more moving parts.
+
+**Why fail-safe on parse failure?** A malformed body the proxy can't read might still be valid to Anthropic (e.g. SDK version skew) but is unlikely to make sense to a LiteLLM gateway with rewritten routing. Defaulting to Anthropic preserves Claude Code's expected behavior for requests the proxy doesn't understand.
+
+**Why probe with `count_tokens`?** It's the cheapest Anthropic endpoint that still returns the unified rate-limit headers. Minimal token cost while redirected.
+
+## Testing
+
+```bash
+npm test
+# or directly:
+node --test tests/smoke.test.js
+```
+
+Tests use Node's built-in `node:test` (Node ≥ 18). Zero npm dependencies. Local mock servers on ephemeral ports — no real Anthropic or LiteLLM calls.
 
 ## Files
 
 ```
-usage-proxy/
+anthropic-quota-proxy/
   proxy.js                zero-dependency Node.js proxy
   install-service.ps1     Windows service installer (run as admin)
   uninstall-service.ps1   Windows service uninstaller (run as admin)
@@ -239,91 +387,3 @@ usage-proxy/
   proxy.log               stdout (1 MB rotation via NSSM)
   proxy-error.log         stderr
 ```
-
----
-
-## v0.2 — LiteLLM fallback mode
-
-### What it does (v0.2)
-
-v0.2 extends the transparent proxy with an optional LiteLLM fallback. When quota on any of the three Anthropic windows approaches a configured threshold, `claude-*` requests are automatically redirected to a local LiteLLM instance with the body's `model` field rewritten to a tier-matched substitute. Non-`claude-*` models (e.g. `gpt-5`, `gemini-*`) always go to LiteLLM regardless of quota. The feature is opt-in: if `LITELLM_URL` is unset the proxy behaves exactly as v0.1 — pure passthrough to `api.anthropic.com`, no model inspection, no probes.
-
-### Default behavior (legacy / v0.1)
-
-With `LITELLM_URL` unset:
-
-- All requests forwarded to `api.anthropic.com` unchanged.
-- Response headers written to `~/.claude/usage-status.md` as before.
-- No body buffering, no quota inspection, no background probe.
-- One new startup log line: `[proxy] feature: litellm-fallback disabled (LITELLM_URL unset)`.
-
-### LiteLLM fallback mode
-
-Set `LITELLM_URL` to enable. All other env vars are optional with the defaults below.
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `LITELLM_URL` | LiteLLM base URL, e.g. `http://localhost:4000`. **Feature gate** — unset = v0.1 behaviour. | unset |
-| `LITELLM_API_KEY` | Bearer token on every LiteLLM-bound request. Required if `LITELLM_URL` is set. | unset |
-| `LITELLM_FALLBACK_OPUS` | Model name substituted when a `claude-opus-*` request is redirected. Set to an empty string to disable (causes 500 on opus redirects). | `claude-opus-4-7` |
-| `LITELLM_FALLBACK_SONNET` | Same, for `claude-sonnet-*`. | `claude-sonnet-4-6` |
-| `LITELLM_FALLBACK_HAIKU` | Same, for `claude-haiku-*`. | `claude-haiku-4-5` |
-| `REDIRECT_AT_5H_PCT` | 5-hour utilization threshold (integer 1–100). | `90` |
-| `REDIRECT_AT_7D_PCT` | 7-day utilization threshold. | `90` |
-| `REDIRECT_AT_OVERAGE_PCT` | Overage utilization threshold. | `80` |
-| `HYSTERESIS_PCT` | How far below the threshold utilization must drop before switching back to Anthropic. Prevents oscillation. | `5` |
-| `PROBE_INTERVAL_MS` | Background probe period while in redirect mode (ms). | `300000` (5 min) |
-| `PROBE_MODEL` | Model used in probe `count_tokens` requests. | `claude-haiku-4-5` |
-| `ANTHROPIC_API_KEY_FOR_PROBES` | Dedicated Anthropic key for probe requests. When set, the cached client bearer is never used for probes. | unset (cached client auth used) |
-| `MAX_BUFFER_BYTES` | Maximum body size buffered on `/v1/messages` and `/v1/messages/count_tokens`. Requests exceeding this return 413. | `10485760` (10 MB) |
-| `ANTHROPIC_HOST_OVERRIDE` | Override Anthropic target as `host[:port]`. **Test seam — not for production use.** | `api.anthropic.com:443` |
-| `CLAUDE_USAGE_FILE` | Override `~/.claude/usage-status.md` path. | `~/.claude/usage-status.md` |
-
-### Dispatch rules
-
-| Model prefix | Quota state | Upstream | Body rewritten? |
-|-------------|-------------|----------|----------------|
-| `claude-opus-*` | below threshold | Anthropic | no |
-| `claude-sonnet-*` | below threshold | Anthropic | no |
-| `claude-haiku-*` | below threshold | Anthropic | no |
-| `claude-opus-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_OPUS` |
-| `claude-sonnet-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_SONNET` |
-| `claude-haiku-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_HAIKU` |
-| `claude-*` (unknown tier) | at/above threshold | LiteLLM | no (forwarded as-is) |
-| anything else (`gpt-*`, `gemini-*`, …) | any | LiteLLM | no |
-
-Redirect engages when **any one** of the three utilization windows is at or above its threshold. Switch-back requires **all three** to drop below `threshold − HYSTERESIS_PCT` (default 5 points). Tier classification is by case-insensitive substring match: a model name containing `opus` is opus-tier, `sonnet` is sonnet-tier, `haiku` is haiku-tier.
-
-### Background probe
-
-While in redirect mode the proxy cannot see fresh Anthropic rate-limit headers (requests go to LiteLLM). A background timer fires every `PROBE_INTERVAL_MS` and sends a minimal `POST /v1/messages/count_tokens` to Anthropic using the most recently observed client auth header. The probe response updates the in-memory quota state; if quota has dropped below the switch-back threshold the next `claude-*` request goes to Anthropic again.
-
-If no client request has been seen yet (no cached auth) and `ANTHROPIC_API_KEY_FOR_PROBES` is unset, the probe tick is skipped.
-
-After three consecutive probe failures (e.g. 401 from Anthropic), the probe interval doubles up to a 1-hour cap. When a client request arrives with a different auth value (key rotation), the backoff is immediately reset and the probe fires at the original cadence.
-
-### Buffering caveat
-
-Body-bearing endpoints (`/v1/messages`, `/v1/messages/count_tokens`) are buffered up to `MAX_BUFFER_BYTES` (10 MB default) when `LITELLM_URL` is set; oversized bodies return 413 before any upstream call is made.
-
-### Auth-cache threat model
-
-The probe reuses the cached client `authorization` / `x-api-key` header when `ANTHROPIC_API_KEY_FOR_PROBES` is unset. This cache is in-memory, lasts for the lifetime of the proxy process, and is used only for probe calls to `api.anthropic.com:443` over TLS. It is never logged, never written to disk, and never sent to LiteLLM.
-
-Security-conscious operators should set `ANTHROPIC_API_KEY_FOR_PROBES` to a dedicated probe-only key, which eliminates the cached-bearer threat scope entirely.
-
-**Single-tenancy note:** this proxy assumes one Anthropic account per running instance. Sharing a single proxy across multiple Anthropic accounts will cause quota-state pollution (quota is aggregated across all accounts) and probe-credential cross-contamination (the cached auth may belong to a different account than the current request). Run one proxy instance per Anthropic account.
-
-### Running as a service
-
-See `install-service.ps1` (Windows/NSSM) and `uninstall-service.ps1` for Windows service setup. For macOS and Linux, use the launchd/systemd examples in the Setup section above.
-
-### Testing
-
-```bash
-npm test
-# or directly:
-node --test tests/smoke.test.js
-```
-
-The smoke test suite uses Node's built-in `node:test` (Node >= 18). No npm dependencies required. Tests use local mock servers on ephemeral ports — no real Anthropic or LiteLLM calls are made.
