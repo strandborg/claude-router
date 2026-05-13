@@ -181,6 +181,7 @@ let probeIntervalMs = config.probeIntervalMs;
 let activeProbeTimer = null;
 
 let headersLogged = false; // log all ratelimit headers once to discover per-model pools
+let noUtilHeadersLogged = false; // log once when an Anthropic response carries no util headers
 
 // ---------------------------------------------------------------------------
 // Usage file + quota mutation
@@ -205,7 +206,17 @@ function writeUsageFile(headers) {
     const status7d = headers['anthropic-ratelimit-unified-7d-status'] || '';
     const status5h = headers['anthropic-ratelimit-unified-5h-status'] || '';
 
-    if (fiveH === null && sevenD === null) return;
+    if (fiveH === null && sevenD === null) {
+        // Diagnostic: this is the silent stranding mode. If the probe / non-body-bearing
+        // endpoint does not include unified-utilization headers, quotaState never updates
+        // and the proxy gets stuck in litellm mode forever. Logging once (gated like the
+        // header dump) keeps recurring requests quiet but makes the situation visible.
+        if (!noUtilHeadersLogged) {
+            console.warn('[proxy] writeUsageFile: response had no unified-utilization headers — quotaState not updated. Endpoint does not surface rate-limit data.');
+            noUtilHeadersLogged = true;
+        }
+        return;
+    }
 
     const now = new Date().toLocaleString('en-GB', {
         year: 'numeric', month: '2-digit', day: '2-digit',
@@ -573,8 +584,14 @@ function runProbe() {
         return; // AC8: skip before first client req when no env-supplied key
     }
 
+    // Probe target was /v1/messages/count_tokens, but empirically that endpoint does
+    // not return the anthropic-ratelimit-unified-*-utilization headers. With those
+    // missing, writeUsageFile early-returns and quotaState never refreshes, leaving
+    // the proxy stranded in litellm mode. /v1/messages with max_tokens=1 reliably
+    // returns the headers and consumes a trivial amount of quota (~1 token/probe).
     const body = JSON.stringify({
         model: config.probeModel,
+        max_tokens: 1,
         messages: [{ role: 'user', content: '.' }],
     });
     headers['content-length'] = Buffer.byteLength(body);
@@ -582,15 +599,17 @@ function runProbe() {
     const req = https.request({
         hostname: config.anthropicHost,
         port: config.anthropicPort,
-        path: '/v1/messages/count_tokens',
+        path: '/v1/messages',
         method: 'POST',
         headers,
         timeout: PROBE_TIMEOUT_MS,
     }, (res) => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
+            const modeBefore = mode;
             writeUsageFile(res.headers); // also updates quotaState + may flip mode
             probeFailures = 0;
             probeIntervalMs = config.probeIntervalMs;
+            console.log(`[proxy] probe: 200 5h=${quotaState.fiveHourPct}% 7d=${quotaState.sevenDayPct}% overage=${quotaState.overagePct}% mode=${modeBefore}->${mode}`);
         } else {
             probeFailures++;
             console.warn(`[proxy] probe: status ${res.statusCode} (failures=${probeFailures})`);
