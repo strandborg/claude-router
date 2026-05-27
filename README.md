@@ -8,13 +8,15 @@ A local HTTP router for Claude Code. Routes each request to either `api.anthropi
 
 ## What it does
 
-The router has two capabilities that can be used independently:
+The router has three capabilities that can be used independently:
 
 1. **Quota visibility** — always on. Forwards every request to Anthropic unchanged, scrapes the `anthropic-ratelimit-*` response headers, and writes a one-line status file at `~/.claude/usage-status.md`. Claude reads that file to know how close it is to the 5-hour, 7-day, and overage limits.
 
 2. **LiteLLM fallback** — opt-in via `LITELLM_URL`. When any utilization window hits a configured threshold, `claude-*` requests are redirected to a local LiteLLM instance with the body's `model` field rewritten to a tier-matched substitute (`opus`, `sonnet`, `haiku`). Non-Anthropic models (`gpt-*`, `gemini-*`, etc.) always go to LiteLLM regardless of quota, with the body forwarded as-is.
 
-If `LITELLM_URL` is unset, claude-router is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
+3. **Composer 2.5** — opt-in via `CURSOR_API_KEY`. Routes requests to Cursor's Composer 2.5 model via native Anthropic↔OpenAI translation, enabling Claude Code to use Composer as an alternative model alongside Anthropic and LiteLLM options. Switch by naming any model matching `composer-*` (e.g. `composer-2.5`).
+
+If both `LITELLM_URL` and `CURSOR_API_KEY` are unset, claude-router is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
 
 ## How it works
 
@@ -178,6 +180,23 @@ The fallback feature activates only when `LITELLM_URL` is set. All other variabl
 | `MAX_BUFFER_BYTES` | Maximum body size buffered on `/v1/messages` and `/v1/messages/count_tokens`. Requests exceeding this return 413. | `10485760` (10 MB) |
 | `ANTHROPIC_HOST_OVERRIDE` | Override Anthropic target as `host[:port]`. **Test seam — not for production.** | `api.anthropic.com:443` |
 
+### Composer 2.5 (opt-in)
+
+The Composer feature activates only when `CURSOR_API_KEY` is set. All other variables in this table are no-ops while it is unset.
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `CURSOR_API_KEY` | Bearer token sent on every Composer-bound request. **Feature gate** — unset disables Composer. Obtain from Cursor Dashboard → Integrations. | unset |
+| `COMPOSER_API_URL` | Composer API base URL. **Host-only** — scheme, host, and port are used; any path component in the URL is ignored, since the fixed route `/opencodev2/v1/chat/completions` is always appended. | `https://cursor-api.standardagents.ai` |
+
+**How to use:** Set your `CURSOR_API_KEY` from the Cursor Dashboard (Integrations section), then in Claude Code select a model name starting with `composer` — e.g. type `composer-2.5` when prompted for a model. The router translates your Anthropic Messages API request to OpenAI chat-completions format, forwards it to Composer, and translates the response back. Streaming is fully supported.
+
+**Known limitations (best-effort):**
+- `tool_result` errors (`is_error: true`) are forwarded as plain tool-role content with no structured error marker — OpenAI's tool role has no error channel.
+- Image input is best-effort; some image formats may not round-trip perfectly.
+- Token usage is estimated by composer-api and displayed for reference only — it does not update the `~/.claude/usage-status.md` quota file.
+- Composer is **explicit-only** — it is never used as a quota fallback target when `LITELLM_URL` is configured. Name `composer-*` explicitly to route to Composer.
+
 ## Routing reference
 
 ### Dispatch rules
@@ -191,6 +210,7 @@ The fallback feature activates only when `LITELLM_URL` is set. All other variabl
 | `claude-sonnet-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_SONNET` |
 | `claude-haiku-*` | at/above threshold | LiteLLM | yes → `LITELLM_FALLBACK_HAIKU` |
 | `claude-*` (unknown tier) | at/above threshold | LiteLLM | no (forwarded as-is) |
+| `composer-*` | any | Composer | no (translated to OpenAI format) |
 | anything else (`gpt-*`, `gemini-*`, …) | any | LiteLLM | no |
 | body unparseable / missing model | any | Anthropic (fail-safe) | no |
 

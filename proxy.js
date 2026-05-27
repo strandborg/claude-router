@@ -5,6 +5,23 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
+
+// Decompress a buffered upstream body per its content-encoding. We force
+// `accept-encoding: identity` toward Composer (we must read the body to translate
+// it), so this is a defensive fallback for servers that compress anyway. Node 20
+// has no zstd decoder, so zstd is intentionally not handled here — `identity`
+// prevents it upstream. Returns the original buffer if encoding is absent/unknown
+// or decompression fails.
+function decompressBody(buf, contentEncoding) {
+    const enc = (contentEncoding || '').trim().toLowerCase();
+    try {
+        if (enc === 'gzip' || enc === 'x-gzip') return zlib.gunzipSync(buf);
+        if (enc === 'deflate') return zlib.inflateSync(buf);
+        if (enc === 'br') return zlib.brotliDecompressSync(buf);
+    } catch { /* fall through to raw buffer */ }
+    return buf;
+}
 
 const PORT = 4080;
 const BIND = '127.0.0.1';
@@ -146,9 +163,17 @@ const config = {
     anthropicApiKeyForProbes: process.env.ANTHROPIC_API_KEY_FOR_PROBES || '',
     anthropicHost: anthropicTarget.host,
     anthropicPort: anthropicTarget.port,
+    // Composer 2.5 backend (opt-in, independent of litellm). Enabled iff CURSOR_API_KEY set.
+    composerApiUrl: process.env.COMPOSER_API_URL || 'https://cursor-api.standardagents.ai',
+    cursorApiKey: process.env.CURSOR_API_KEY || '',
 };
 
 const FEATURE_ENABLED = !!config.litellmUrl;
+// Composer feature gate — computed from cursorApiKey ONLY, never referencing litellmUrl (AC2 independence).
+const COMPOSER_ENABLED = !!config.cursorApiKey;
+// Fixed tool-capable route on composer-api (spec L38/AC8). COMPOSER_API_URL is host-only;
+// any path component in the env value is ignored and this route is always appended at dispatch.
+const COMPOSER_ROUTE = '/opencodev2/v1/chat/completions';
 
 // Pre-parse LiteLLM URL once at startup so dispatch is cheap.
 let litellmParsed = null;
@@ -165,6 +190,27 @@ if (FEATURE_ENABLED) {
         };
     } catch (err) {
         console.error(`[proxy] Invalid LITELLM_URL '${config.litellmUrl}': ${err.message}`);
+        process.exit(1);
+    }
+}
+
+// Pre-parse COMPOSER_API_URL once at startup (mirrors the litellm parse above). Host-only:
+// scheme/host/port are used; any path component is discarded (the fixed COMPOSER_ROUTE is
+// appended at dispatch). `composerParsed` is parsed-once immutable config (NOT per-request
+// mutable state — distinct from the translator-state rule in Principle 6).
+let composerParsed = null;
+if (COMPOSER_ENABLED) {
+    try {
+        const u = new URL(config.composerApiUrl);
+        const defaultPort = u.protocol === 'https:' ? 443 : 80;
+        composerParsed = {
+            protocol: u.protocol,
+            hostname: u.hostname,
+            port: u.port ? Number(u.port) : defaultPort,
+            hostHeader: u.port ? `${u.hostname}:${u.port}` : u.hostname,
+        };
+    } catch (err) {
+        console.error(`[proxy] Invalid COMPOSER_API_URL '${config.composerApiUrl}': ${err.message}`);
         process.exit(1);
     }
 }
@@ -291,6 +337,382 @@ function captureClientAuth(headers) {
         }
         if (mode === 'litellm') scheduleNextProbe();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Composer translation (Anthropic Messages <-> OpenAI chat-completions)
+// Pure functions — no I/O, no module-level mutable state. Exported for unit tests.
+// ---------------------------------------------------------------------------
+
+// Flatten an Anthropic content value (string OR array of blocks) to a plain string.
+// Used for `system` and for `tool_result.content`.
+function flattenAnthropicText(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        return content
+            .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+            .map((b) => b.text)
+            .join('');
+    }
+    return '';
+}
+
+// OpenAI finish_reason -> Anthropic stop_reason. null/absent (mid-stream) -> null.
+function mapFinishReason(fr) {
+    if (fr === 'stop') return 'end_turn';
+    if (fr === 'tool_calls') return 'tool_use';
+    if (fr === 'length') return 'max_tokens';
+    if (fr === 'content_filter') return 'end_turn'; // best-effort
+    return null;
+}
+
+function randomMsgId() {
+    return 'msg_' + Math.random().toString(36).slice(2, 14);
+}
+
+// anthropicToOpenAIRequest(parsed) — translate a parsed Anthropic Messages request body
+// into an OpenAI chat-completions request body. `model` is forwarded as-is (AC3).
+function anthropicToOpenAIRequest(parsed) {
+    const out = {
+        model: parsed.model,
+        messages: [],
+        stream: parsed.stream === true,
+    };
+    // Sampling params — omit when absent (never send undefined).
+    if (parsed.max_tokens !== undefined) out.max_tokens = parsed.max_tokens;
+    if (parsed.temperature !== undefined) out.temperature = parsed.temperature;
+    if (parsed.top_p !== undefined) out.top_p = parsed.top_p;
+    if (parsed.stop_sequences !== undefined) out.stop = parsed.stop_sequences;
+
+    // system (string or array of text blocks) -> leading system message.
+    if (parsed.system !== undefined && parsed.system !== null) {
+        const sysText = flattenAnthropicText(parsed.system);
+        if (sysText) out.messages.push({ role: 'system', content: sysText });
+    }
+
+    const msgs = Array.isArray(parsed.messages) ? parsed.messages : [];
+    for (const msg of msgs) {
+        const role = msg.role;
+        const content = msg.content;
+
+        if (role === 'user') {
+            if (typeof content === 'string') {
+                out.messages.push({ role: 'user', content });
+                continue;
+            }
+            if (Array.isArray(content)) {
+                const textParts = [];
+                const toolMessages = [];
+                for (const block of content) {
+                    if (!block || typeof block !== 'object') continue;
+                    if (block.type === 'text' && typeof block.text === 'string') {
+                        textParts.push(block.text);
+                    } else if (block.type === 'tool_result') {
+                        // M3: OpenAI's tool-role message has NO error channel. An Anthropic
+                        // tool_result with is_error:true is forwarded as ordinary content with
+                        // no marker (best-effort) — the model sees error text, not a flag.
+                        toolMessages.push({
+                            role: 'tool',
+                            tool_call_id: block.tool_use_id,
+                            content: flattenAnthropicText(block.content),
+                        });
+                    }
+                }
+                // Emit tool messages first so they follow the prior assistant tool_calls turn,
+                // then any free-standing user text (correlated by tool_use_id, AC7).
+                for (const tm of toolMessages) out.messages.push(tm);
+                if (textParts.length) out.messages.push({ role: 'user', content: textParts.join('') });
+                continue;
+            }
+            continue;
+        }
+
+        if (role === 'assistant') {
+            if (typeof content === 'string') {
+                out.messages.push({ role: 'assistant', content });
+                continue;
+            }
+            if (Array.isArray(content)) {
+                const textParts = [];
+                const toolCalls = [];
+                for (const block of content) {
+                    if (!block || typeof block !== 'object') continue;
+                    if (block.type === 'text' && typeof block.text === 'string') {
+                        textParts.push(block.text);
+                    } else if (block.type === 'tool_use') {
+                        toolCalls.push({
+                            id: block.id, // preserved verbatim for round-trip (R2)
+                            type: 'function',
+                            function: {
+                                name: block.name,
+                                arguments: JSON.stringify(block.input ?? {}),
+                            },
+                        });
+                    }
+                }
+                const assistantMsg = { role: 'assistant' };
+                if (toolCalls.length) {
+                    // M2: content:null (NOT '') when tool_calls present and no text — some
+                    // OpenAI-compatible backends reject content:'' alongside tool_calls.
+                    assistantMsg.content = textParts.length ? textParts.join('') : null;
+                    assistantMsg.tool_calls = toolCalls;
+                } else {
+                    assistantMsg.content = textParts.join('');
+                }
+                out.messages.push(assistantMsg);
+                continue;
+            }
+            continue;
+        }
+
+        // Unknown role — best-effort passthrough for string content.
+        if (typeof content === 'string') out.messages.push({ role, content });
+    }
+
+    // tools: Anthropic {name, description, input_schema} -> OpenAI function tool.
+    if (Array.isArray(parsed.tools) && parsed.tools.length) {
+        out.tools = parsed.tools.map((t) => ({
+            type: 'function',
+            function: {
+                name: t.name,
+                description: t.description,
+                parameters: t.input_schema,
+            },
+        }));
+    }
+    // tool_choice: auto->auto, any->required, {type:'tool',name}->{type:'function',function:{name}}.
+    if (parsed.tool_choice !== undefined && parsed.tool_choice !== null) {
+        const tc = parsed.tool_choice;
+        if (tc.type === 'auto') out.tool_choice = 'auto';
+        else if (tc.type === 'any') out.tool_choice = 'required';
+        else if (tc.type === 'tool' && tc.name) out.tool_choice = { type: 'function', function: { name: tc.name } };
+    }
+
+    return out;
+}
+
+// openAIToAnthropicResponse(openai, reqModel) — translate a non-streaming OpenAI
+// chat-completion object into an Anthropic Messages response object.
+// C4: returns `null` when there is no usable choice/message — the caller surfaces a 502.
+function openAIToAnthropicResponse(openai, reqModel) {
+    const choice = openai && openai.choices && openai.choices[0];
+    if (!choice || !choice.message) return null;
+    const msg = choice.message;
+
+    const content = [];
+    if (typeof msg.content === 'string' && msg.content.length > 0) {
+        content.push({ type: 'text', text: msg.content });
+    }
+    if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+            const fn = tc.function || {};
+            let input = {};
+            try {
+                input = JSON.parse(fn.arguments && fn.arguments.length ? fn.arguments : '{}');
+            } catch {
+                input = {}; // best-effort: never crash on malformed arguments
+            }
+            content.push({ type: 'tool_use', id: tc.id, name: fn.name, input });
+        }
+    }
+
+    const usage = openai.usage || {};
+    return {
+        id: openai.id || randomMsgId(),
+        type: 'message',
+        role: 'assistant',
+        model: reqModel,
+        content,
+        stop_reason: mapFinishReason(choice.finish_reason) ?? 'end_turn',
+        stop_sequence: null,
+        usage: {
+            // Display only — does NOT feed writeUsageFile/quotaState (AC10).
+            input_tokens: usage.prompt_tokens ?? 0,
+            output_tokens: usage.completion_tokens ?? 0,
+        },
+    };
+}
+
+// makeSSETranslator(reqModel, emit) — factory returning { feed(chunkStr), end() }.
+// `emit(eventType, dataObj)` writes one Anthropic SSE event. ALL mutable state lives
+// inside this closure (Principle 6 / R9) — nothing at module scope.
+function makeSSETranslator(reqModel, emit) {
+    let started = false;          // emitted message_start yet?
+    let finalized = false;        // C3: close sequence emitted yet?
+    let nextBlockIndex = 0;       // C2: lazy Anthropic block-index allocator
+    let textBlockIndex = null;    // Anthropic index of the (single) text block, once opened
+    const toolIndexMap = new Map(); // C2: OpenAI tc.index -> { anthropicIndex, opened, id, argBuffer }
+    let openBlockIndex = null;    // index of the currently-open content block
+    let stopReason = null;        // captured from finish_reason
+    let usageOutputTokens = 0;    // stashed completion_tokens (defaults 0)
+    let usageInputTokens = 0;     // stashed prompt_tokens
+    let lineBuf = '';             // partial-line buffer across TCP chunks
+
+    function ensureStarted(chunk) {
+        if (started) return;
+        started = true;
+        if (chunk && chunk.usage && typeof chunk.usage.prompt_tokens === 'number') {
+            usageInputTokens = chunk.usage.prompt_tokens;
+        }
+        emit('message_start', {
+            type: 'message_start',
+            message: {
+                id: (chunk && chunk.id) || randomMsgId(),
+                type: 'message',
+                role: 'assistant',
+                model: reqModel,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: usageInputTokens, output_tokens: 0 },
+            },
+        });
+    }
+
+    function closeOpenBlock() {
+        if (openBlockIndex !== null) {
+            emit('content_block_stop', { type: 'content_block_stop', index: openBlockIndex });
+            openBlockIndex = null;
+        }
+    }
+
+    function openTextBlock() {
+        // N1: if a non-text block is open, close it before opening/reopening the text block.
+        if (openBlockIndex !== null && openBlockIndex !== textBlockIndex) closeOpenBlock();
+        if (textBlockIndex === null) textBlockIndex = nextBlockIndex++; // C2: lazy allocation
+        emit('content_block_start', {
+            type: 'content_block_start',
+            index: textBlockIndex,
+            content_block: { type: 'text', text: '' },
+        });
+        openBlockIndex = textBlockIndex;
+    }
+
+    function finalize() {
+        if (finalized) return; // C3: idempotent
+        finalized = true;
+        if (!started) ensureStarted(null); // zero-delta streams still produce a valid envelope
+        closeOpenBlock();
+        emit('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: stopReason ?? 'end_turn', stop_sequence: null },
+            usage: { output_tokens: usageOutputTokens ?? 0 },
+        });
+        emit('message_stop', { type: 'message_stop' });
+    }
+
+    function processChunk(chunk) {
+        // C4 / usage capture: stash usage even on choice-less chunks.
+        if (chunk.usage) {
+            if (typeof chunk.usage.completion_tokens === 'number') usageOutputTokens = chunk.usage.completion_tokens;
+            if (typeof chunk.usage.prompt_tokens === 'number') usageInputTokens = chunk.usage.prompt_tokens;
+        }
+        // Mid-stream OpenAI error field -> Anthropic error event -> finalize.
+        if (chunk.error) {
+            ensureStarted(chunk);
+            emit('error', { type: 'error', error: { type: 'upstream_error', message: (chunk.error && chunk.error.message) || 'composer-api error' } });
+            finalize();
+            return;
+        }
+        const choice = chunk.choices && chunk.choices[0];
+        if (!choice) return; // C4: usage-only trailing chunk — captured above, no throw
+        ensureStarted(chunk);
+        const delta = choice.delta || {};
+
+        // Text deltas.
+        if (typeof delta.content === 'string' && delta.content.length > 0) {
+            // N1: assumes upstream emits all text before tool_calls within a single response;
+            // re-interleaved text after a tool block is best-effort (close tool block, reopen text).
+            if (textBlockIndex === null || openBlockIndex !== textBlockIndex) openTextBlock();
+            emit('content_block_delta', {
+                type: 'content_block_delta',
+                index: textBlockIndex,
+                delta: { type: 'text_delta', text: delta.content },
+            });
+        }
+
+        // Tool-call deltas. OpenAI tc.index is a SEPARATE namespace — never used as the
+        // Anthropic block index (C2); mapped through toolIndexMap.
+        if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+                const key = tc.index;
+                let entry = toolIndexMap.get(key);
+                if (!entry) {
+                    // First appearance keyed on tc.index (not on id presence).
+                    entry = { anthropicIndex: null, opened: false, id: null, argBuffer: '' };
+                    toolIndexMap.set(key, entry);
+                }
+                if (tc.id && !entry.id) entry.id = tc.id;
+                const fn = tc.function || {};
+                const name = fn.name;
+                // Defer content_block_start until BOTH id and name are known.
+                if (!entry.opened && entry.id && name) {
+                    entry.anthropicIndex = nextBlockIndex++; // C2: lazy allocation
+                    if (openBlockIndex !== null) closeOpenBlock();
+                    emit('content_block_start', {
+                        type: 'content_block_start',
+                        index: entry.anthropicIndex,
+                        content_block: { type: 'tool_use', id: entry.id, name, input: {} },
+                    });
+                    entry.opened = true;
+                    openBlockIndex = entry.anthropicIndex;
+                    // Flush any argument fragments buffered before the block opened.
+                    if (entry.argBuffer) {
+                        emit('content_block_delta', {
+                            type: 'content_block_delta',
+                            index: entry.anthropicIndex,
+                            delta: { type: 'input_json_delta', partial_json: entry.argBuffer },
+                        });
+                        entry.argBuffer = '';
+                    }
+                }
+                // Argument fragments — opaque, forwarded verbatim, never parsed mid-stream (R3).
+                if (typeof fn.arguments === 'string' && fn.arguments.length > 0) {
+                    if (entry.opened) {
+                        emit('content_block_delta', {
+                            type: 'content_block_delta',
+                            index: entry.anthropicIndex,
+                            delta: { type: 'input_json_delta', partial_json: fn.arguments },
+                        });
+                    } else {
+                        entry.argBuffer += fn.arguments; // buffer until the block opens
+                    }
+                }
+            }
+        }
+
+        // finish_reason — stash only; finalize is shared/idempotent (C3).
+        if (choice.finish_reason) stopReason = mapFinishReason(choice.finish_reason);
+    }
+
+    function feed(chunkStr) {
+        if (finalized) return;
+        lineBuf += chunkStr;
+        let nlIdx;
+        while ((nlIdx = lineBuf.indexOf('\n')) !== -1) {
+            let line = lineBuf.slice(0, nlIdx);
+            lineBuf = lineBuf.slice(nlIdx + 1);
+            if (line.endsWith('\r')) line = line.slice(0, -1); // CRLF tolerance
+            line = line.trim();
+            if (line === '' || !line.startsWith('data:')) continue;
+            const data = line.slice(5).trim(); // tolerate both 'data: ' and 'data:'
+            if (data === '[DONE]') { finalize(); return; }
+            let chunk;
+            try {
+                chunk = JSON.parse(data);
+            } catch {
+                continue; // ignore unparseable line
+            }
+            processChunk(chunk);
+            if (finalized) return; // a delta-carried error may have finalized
+        }
+    }
+
+    function end() {
+        finalize();
+    }
+
+    return { feed, end };
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +852,161 @@ function forwardToLiteLLM(clientReq, clientRes, opts) {
     upstreamReq.end();
 }
 
+// forwardToComposer — native Anthropic<->OpenAI translating forwarder for the Composer
+// backend. Mirrors forwardToLiteLLM's header discipline but POSTs to the fixed COMPOSER_ROUTE
+// and translates both request and response. NEVER calls writeUsageFile (AC10).
+function forwardToComposer(clientReq, clientRes, opts) {
+    const { parsed, modelName } = opts;
+    const isStream = parsed.stream === true;
+
+    // Translate the inbound Anthropic request to OpenAI chat-completions shape.
+    let openaiBody;
+    try {
+        openaiBody = anthropicToOpenAIRequest(parsed);
+    } catch (err) {
+        console.error('[proxy] Composer request translation error:', err.message);
+        if (!clientRes.headersSent) clientRes.writeHead(502, { 'content-type': 'application/json' });
+        return clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'composer request translation failed' } }));
+    }
+    const outBuf = Buffer.from(JSON.stringify(openaiBody));
+
+    // Header hygiene: strip inbound Anthropic auth + hop-by-hop, inject Cursor bearer.
+    const upstreamHeaders = {
+        ...stripHopByHop(clientReq.headers),
+        host: composerParsed.hostHeader,
+        authorization: `Bearer ${config.cursorApiKey}`,
+        'content-length': Buffer.byteLength(outBuf),
+        'content-type': 'application/json',
+        accept: isStream ? 'text/event-stream' : 'application/json',
+        // We buffer/parse/re-frame the response to translate it, so we need it
+        // uncompressed. The inbound Claude Code request advertises zstd/gzip/br,
+        // which Composer honored (zstd) — and Node 20 cannot decode zstd. Override
+        // to identity so both the JSON parse and the SSE translator see plain bytes.
+        'accept-encoding': 'identity',
+    };
+    delete upstreamHeaders['x-api-key']; // strip inbound Anthropic auth (mirrors litellm)
+
+    const requester = composerParsed.protocol === 'https:' ? https : http;
+    let streamHeadersSent = false; // R10: once 200+SSE headers sent, cannot writeHead(502)
+
+    const upstreamReq = requester.request({
+        hostname: composerParsed.hostname,
+        port: composerParsed.port,
+        path: COMPOSER_ROUTE, // fixed route, NOT clientReq.url (inbound path is /v1/messages)
+        method: 'POST',
+        headers: upstreamHeaders,
+        timeout: UPSTREAM_TIMEOUT_MS,
+    }, (upstreamRes) => {
+        // NEVER call writeUsageFile here — Composer never touches the usage file / quotaState (AC10).
+        const status = upstreamRes.statusCode;
+
+        // If the client disconnects before the upstream response completes, kill the upstream
+        // to avoid orphaned sockets (mirrors forwardToAnthropic/forwardToLiteLLM). Single guard
+        // covering all branches (non-2xx, streaming, non-streaming) — no double-destroy.
+        let responseEnded = false;
+        upstreamRes.on('end', () => { responseEnded = true; });
+        clientReq.on('close', () => { if (!responseEnded) upstreamReq.destroy(); });
+
+        // Non-2xx upstream -> translate to an Anthropic-shaped error envelope.
+        if (status < 200 || status >= 300) {
+            const chunks = [];
+            upstreamRes.on('data', (c) => chunks.push(c));
+            upstreamRes.on('end', () => {
+                let message = 'composer-api error';
+                let errType = 'upstream_error';
+                try {
+                    const body = JSON.parse(decompressBody(Buffer.concat(chunks), upstreamRes.headers['content-encoding']).toString('utf8'));
+                    if (body && body.error) {
+                        message = body.error.message || message;
+                        errType = body.error.type || errType;
+                    }
+                } catch { /* keep defaults */ }
+                if (!clientRes.headersSent) clientRes.writeHead(status, { 'content-type': 'application/json' });
+                clientRes.end(JSON.stringify({ type: 'error', error: { type: errType, message } }));
+            });
+            return;
+        }
+
+        if (isStream) {
+            clientRes.writeHead(200, {
+                'content-type': 'text/event-stream',
+                'cache-control': 'no-cache',
+                connection: 'keep-alive',
+            });
+            streamHeadersSent = true;
+            const sse = makeSSETranslator(modelName, (type, obj) => {
+                clientRes.write('event: ' + type + '\ndata: ' + JSON.stringify(obj) + '\n\n');
+            });
+            upstreamRes.on('data', (chunk) => sse.feed(chunk.toString('utf8')));
+            upstreamRes.on('end', () => {
+                sse.end(); // idempotent finalize — covers streams that end without [DONE]
+                clientRes.end();
+            });
+            return;
+        }
+
+        // Non-streaming: buffer the full body, parse, translate.
+        const upstreamCT = upstreamRes.headers['content-type'] || '';
+        const chunks = [];
+        upstreamRes.on('data', (c) => chunks.push(c));
+        upstreamRes.on('end', () => {
+            const rawBody = decompressBody(Buffer.concat(chunks), upstreamRes.headers['content-encoding']).toString('utf8');
+            let openai;
+            try {
+                openai = JSON.parse(rawBody);
+            } catch {
+                console.error('[proxy] Composer non-streaming parse failed: status=' + status +
+                    ' content-type=' + JSON.stringify(upstreamCT) + ' bodyLen=' + rawBody.length +
+                    ' bodyHead=' + JSON.stringify(rawBody.slice(0, 300)));
+                if (!clientRes.headersSent) clientRes.writeHead(502, { 'content-type': 'application/json' });
+                return clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'composer-api returned invalid JSON' } }));
+            }
+            const anthropic = openAIToAnthropicResponse(openai, modelName);
+            if (!anthropic) {
+                // C4: no usable choice/message -> clear 502 (Principle 4, fail safe).
+                console.error('[proxy] Composer non-streaming no usable choice: status=' + status +
+                    ' content-type=' + JSON.stringify(upstreamCT) + ' bodyHead=' + JSON.stringify(rawBody.slice(0, 300)));
+                if (!clientRes.headersSent) clientRes.writeHead(502, { 'content-type': 'application/json' });
+                return clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'composer-api returned no choices' } }));
+            }
+            const outJson = JSON.stringify(anthropic);
+            if (!clientRes.headersSent) {
+                clientRes.writeHead(status, {
+                    'content-type': 'application/json',
+                    'content-length': Buffer.byteLength(outJson),
+                });
+            }
+            clientRes.end(outJson);
+        });
+    });
+
+    upstreamReq.on('timeout', () => {
+        upstreamReq.destroy(new Error('Upstream request timed out'));
+    });
+
+    upstreamReq.on('error', (err) => {
+        console.error('[proxy] Composer upstream error:', err.message);
+        if (streamHeadersSent) {
+            // R10 / Step 4.6a: 200 already committed — emit a terminal Anthropic error SSE event.
+            try {
+                clientRes.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: err.message } }) + '\n\n');
+            } catch { /* ignore */ }
+            return clientRes.end();
+        }
+        if (!clientRes.headersSent) clientRes.writeHead(502, { 'content-type': 'application/json' });
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'composer upstream error' } }));
+    });
+
+    clientReq.on('error', (err) => {
+        console.error('[proxy] Client request error:', err.message);
+        upstreamReq.destroy(err);
+    });
+
+    console.log(`[proxy] dispatch: composer model=${modelName} stream=${isStream}`);
+    upstreamReq.write(outBuf);
+    upstreamReq.end();
+}
+
 // ---------------------------------------------------------------------------
 // Body buffering + routing
 // ---------------------------------------------------------------------------
@@ -485,7 +1062,18 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
     const modelName = parsed && typeof parsed.model === 'string' ? parsed.model : null;
     const tier = classifyModel(modelName);
 
-    if (tier === 'non-claude') {
+    // ROUTING-ORDER INVARIANT: this /^composer/i check MUST stay above BOTH the
+    // non-claude->litellm branch (below) AND the shouldRedirect block. Composer is
+    // explicit-only and must never be reached via quota redirect. Reordering this block
+    // reintroduces the C1/C2-class bugs (Composer reachable via redirect / wrong upstream).
+    if (COMPOSER_ENABLED && typeof modelName === 'string' && /^composer/i.test(modelName)) {
+        return forwardToComposer(clientReq, clientRes, { parsed, modelName });
+    }
+
+    // C1 Fix A: guard with FEATURE_ENABLED — with litellm off (Composer-on body inspection),
+    // a non-claude model must fall through to the Anthropic passthrough at the end, NOT reach
+    // forwardToLiteLLM with a null litellmParsed (crash).
+    if (tier === 'non-claude' && FEATURE_ENABLED) {
         return forwardToLiteLLM(clientReq, clientRes, {
             bodyBuf,
             rewrite: false,
@@ -494,7 +1082,11 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
         });
     }
 
-    if (shouldRedirect(quotaState, config.thresholds, mode)) {
+    // C1 Fix B (CRITICAL): guard the redirect block with FEATURE_ENABLED. writeUsageFile
+    // mutates quotaState unconditionally (L241-244) and shouldRedirect reads it directly, so
+    // under composer-on/litellm-off a high-quota claude request would otherwise reach
+    // forwardToLiteLLM at the calls below with litellmParsed === null -> crash.
+    if (FEATURE_ENABLED && shouldRedirect(quotaState, config.thresholds, mode)) {
         if (tier === 'unknown') {
             // Spec line 44 carve-out: forward body unchanged to LiteLLM. Only applies
             // when the body PARSED but the model name is an unknown claude-* tier (or
@@ -659,7 +1251,8 @@ try {
 const server = http.createServer((clientReq, clientRes) => {
     captureClientAuth(clientReq.headers);
 
-    if (!FEATURE_ENABLED) {
+    if (!FEATURE_ENABLED && !COMPOSER_ENABLED) {
+        // Both features off: byte-identical to pre-Composer behavior (Principle 1).
         return forwardToAnthropic(clientReq, clientRes, {
             bodyBufOrStream: clientReq,
             captureUsage: true,
@@ -711,6 +1304,10 @@ function startServer() {
         } else {
             console.log('[proxy] feature: litellm-fallback disabled (LITELLM_URL unset)');
         }
+        // Composer line emitted ONLY when enabled (Principle 1: feature-off log identity).
+        if (COMPOSER_ENABLED) {
+            console.log(`[proxy] feature: composer enabled (url=${config.composerApiUrl})`);
+        }
         logStartupWarnings();
         if (FEATURE_ENABLED) scheduleNextProbe();
     });
@@ -734,6 +1331,16 @@ if (require.main === module) {
         rewriteModelInBody,
         parseUtilPct,
         parseHostOverride,
+        // Composer translators (pure) — test seam
+        anthropicToOpenAIRequest,
+        openAIToAnthropicResponse,
+        makeSSETranslator,
+        flattenAnthropicText,
+        mapFinishReason,
+        // Composer config visibility (tests only)
+        COMPOSER_ENABLED,
+        _composerParsed: () => composerParsed,
+        COMPOSER_ROUTE,
         // Internal seams (tests only)
         _state: {
             quotaState,

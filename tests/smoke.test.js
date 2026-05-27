@@ -158,6 +158,7 @@ function requireFreshProxy(env = {}) {
         'LITELLM_FALLBACK_HAIKU', 'REDIRECT_AT_5H_PCT', 'REDIRECT_AT_7D_PCT',
         'REDIRECT_AT_OVERAGE_PCT', 'PROBE_INTERVAL_MS', 'MAX_BUFFER_BYTES',
         'ANTHROPIC_HOST_OVERRIDE', 'ANTHROPIC_API_KEY_FOR_PROBES', 'CLAUDE_USAGE_FILE',
+        'CURSOR_API_KEY', 'COMPOSER_API_URL',
     ];
     const saved = {};
     for (const k of keys) {
@@ -816,6 +817,8 @@ test('I — feature-off log identity (AC9)', async () => {
             env: {
                 ...process.env,
                 LITELLM_URL: '',
+                CURSOR_API_KEY: '',
+                COMPOSER_API_URL: '',
                 ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
                 CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
                 NODE_TLS_REJECT_UNAUTHORIZED: '0',
@@ -1088,4 +1091,957 @@ test('AC8 — probe skipped when no client auth cached', () => {
     assert.equal(proxy._config.anthropicApiKeyForProbes, '', 'No probe API key set — probe would skip');
 
     closeProxy(proxy);
+});
+
+// ---------------------------------------------------------------------------
+// Unit — anthropicToOpenAIRequest (AC3/AC4)
+// ---------------------------------------------------------------------------
+
+test('Unit — anthropicToOpenAIRequest: system, messages, tools, tool_use, tool_result, M2 (AC3/AC4)', () => {
+    const { anthropicToOpenAIRequest } = requireFreshProxy({});
+
+    // system string -> leading system message
+    const r1 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        system: 'You are helpful.',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 100,
+    });
+    assert.equal(r1.messages[0].role, 'system');
+    assert.equal(r1.messages[0].content, 'You are helpful.');
+    assert.equal(r1.messages[1].role, 'user');
+    assert.equal(r1.model, 'composer-2.5');
+    assert.equal(r1.max_tokens, 100);
+    assert.equal(r1.stream, false);
+    // sampling params omitted when absent
+    assert.equal(r1.temperature, undefined);
+    assert.equal(r1.top_p, undefined);
+
+    // system array of text blocks flattened
+    const r2 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        system: [{ type: 'text', text: 'Part1' }, { type: 'text', text: 'Part2' }],
+        messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(r2.messages[0].content, 'Part1Part2');
+
+    // tools: input_schema -> function.parameters
+    const schema = { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] };
+    const r3 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'use tool' }],
+        tools: [{ name: 'read_file', description: 'Reads a file', input_schema: schema }],
+    });
+    assert.equal(r3.tools[0].type, 'function');
+    assert.equal(r3.tools[0].function.name, 'read_file');
+    assert.deepEqual(r3.tools[0].function.parameters, schema);
+
+    // tool_use -> tool_calls: id verbatim, type:'function', arguments=JSON.stringify(input)
+    const r4 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        messages: [{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'tool_abc123', name: 'read_file', input: { path: '/foo.txt' } }],
+        }],
+    });
+    const tc = r4.messages[0].tool_calls[0];
+    assert.equal(tc.id, 'tool_abc123', 'tool_use id preserved verbatim (R2)');
+    assert.equal(tc.type, 'function');
+    assert.equal(tc.function.name, 'read_file');
+    assert.equal(tc.function.arguments, JSON.stringify({ path: '/foo.txt' }), 'arguments are stringified input');
+
+    // M2: content:null (NOT '') when tool_calls present and no text
+    assert.equal(r4.messages[0].content, null, 'content is null when tool_calls present and no text (M2)');
+
+    // Assistant with both text and tool_use: content is the text string
+    const r5 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        messages: [{
+            role: 'assistant',
+            content: [
+                { type: 'text', text: 'Let me read that.' },
+                { type: 'tool_use', id: 'tool_xyz', name: 'read_file', input: { path: '/bar.txt' } },
+            ],
+        }],
+    });
+    assert.equal(r5.messages[0].content, 'Let me read that.', 'content is text when text+tool_calls present');
+    assert.ok(Array.isArray(r5.messages[0].tool_calls), 'tool_calls still present');
+
+    // tool_result -> {role:'tool', tool_call_id, content}; emitted BEFORE user text
+    const r6 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        messages: [{
+            role: 'user',
+            content: [
+                { type: 'tool_result', tool_use_id: 'tool_abc123', content: 'file contents here' },
+                { type: 'text', text: 'Thanks' },
+            ],
+        }],
+    });
+    assert.equal(r6.messages[0].role, 'tool', 'tool_result emitted as role:tool');
+    assert.equal(r6.messages[0].tool_call_id, 'tool_abc123');
+    assert.equal(r6.messages[0].content, 'file contents here');
+    assert.equal(r6.messages[1].role, 'user', 'user text follows tool message');
+    assert.equal(r6.messages[1].content, 'Thanks');
+
+    // sampling params forwarded when present; stop_sequences -> stop; stream forwarded
+    const r7 = anthropicToOpenAIRequest({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: '.' }],
+        temperature: 0.7, top_p: 0.9, stop_sequences: ['END'], stream: true,
+    });
+    assert.equal(r7.temperature, 0.7);
+    assert.equal(r7.top_p, 0.9);
+    assert.deepEqual(r7.stop, ['END']);
+    assert.equal(r7.stream, true);
+});
+
+// ---------------------------------------------------------------------------
+// Unit — openAIToAnthropicResponse (AC5)
+// ---------------------------------------------------------------------------
+
+test('Unit — openAIToAnthropicResponse: tool_calls->tool_use, finish_reason->stop_reason (AC5)', () => {
+    const { openAIToAnthropicResponse } = requireFreshProxy({});
+
+    // tool_calls -> tool_use; finish_reason:'tool_calls' -> stop_reason:'tool_use'
+    const r1 = openAIToAnthropicResponse({
+        id: 'chatcmpl-abc',
+        choices: [{
+            message: {
+                role: 'assistant', content: null,
+                tool_calls: [{ id: 'call_001', type: 'function', function: { name: 'read_file', arguments: '{"path":"/foo.txt"}' } }],
+            },
+            finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+    }, 'composer-2.5');
+    assert.equal(r1.type, 'message');
+    assert.equal(r1.role, 'assistant');
+    assert.equal(r1.model, 'composer-2.5');
+    assert.equal(r1.stop_reason, 'tool_use', 'finish_reason tool_calls -> stop_reason tool_use');
+    const tu = r1.content.find((b) => b.type === 'tool_use');
+    assert.ok(tu, 'tool_use block present');
+    assert.equal(tu.id, 'call_001');
+    assert.equal(tu.name, 'read_file');
+    assert.deepEqual(tu.input, { path: '/foo.txt' });
+    assert.equal(r1.usage.input_tokens, 10);
+    assert.equal(r1.usage.output_tokens, 5);
+
+    // finish_reason:'stop' -> stop_reason:'end_turn'
+    const r2 = openAIToAnthropicResponse({
+        id: 'chatcmpl-xyz',
+        choices: [{ message: { role: 'assistant', content: 'Hello!' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 3 },
+    }, 'composer-2.5');
+    assert.equal(r2.stop_reason, 'end_turn');
+    assert.equal(r2.content[0].type, 'text');
+    assert.equal(r2.content[0].text, 'Hello!');
+
+    // finish_reason:'length' -> stop_reason:'max_tokens'
+    const r3 = openAIToAnthropicResponse({
+        choices: [{ message: { role: 'assistant', content: 'truncated' }, finish_reason: 'length' }],
+    }, 'composer-2.5');
+    assert.equal(r3.stop_reason, 'max_tokens');
+
+    // C4: choices:[] returns null (forwardToComposer surfaces 502)
+    assert.equal(openAIToAnthropicResponse({ choices: [] }, 'composer-2.5'), null, 'choices:[] returns null (C4)');
+    assert.equal(openAIToAnthropicResponse(null, 'composer-2.5'), null, 'null input returns null');
+});
+
+// ---------------------------------------------------------------------------
+// Unit — SSE.a: tool-only stream -> first content_block_start index:0 type tool_use (C2)
+// ---------------------------------------------------------------------------
+
+test('Unit — SSE.a: tool-only stream -> first content_block_start index:0 type:tool_use (C2)', () => {
+    const { makeSSETranslator } = requireFreshProxy({});
+    const events = [];
+    const sse = makeSSETranslator('composer-2.5', (type, obj) => events.push({ type, obj }));
+
+    // First delta: id + name present (no defer needed here)
+    sse.feed('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_001","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}\n\n');
+    // Args fragment
+    sse.feed('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\""}}]},"finish_reason":null}]}\n\n');
+    sse.feed('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"/foo.txt\\"}"}}]},"finish_reason":null}]}\n\n');
+    // finish_reason
+    sse.feed('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+    sse.feed('data: [DONE]\n\n');
+
+    const starts = events.filter((e) => e.type === 'content_block_start');
+    assert.equal(starts.length, 1, 'exactly one content_block_start');
+    assert.equal(starts[0].obj.index, 0, 'first block index is 0 (C2)');
+    assert.equal(starts[0].obj.content_block.type, 'tool_use', 'block type is tool_use');
+    assert.equal(starts[0].obj.content_block.id, 'call_001');
+    assert.equal(starts[0].obj.content_block.name, 'read_file');
+
+    const stops = events.filter((e) => e.type === 'content_block_stop');
+    assert.equal(stops.length, 1, 'matched content_block_stop');
+    assert.equal(stops[0].obj.index, 0);
+
+    const deltas = events.filter((e) => e.type === 'content_block_delta');
+    assert.ok(deltas.length > 0, 'at least one input_json_delta emitted');
+    assert.ok(deltas.every((d) => d.obj.delta.type === 'input_json_delta'), 'all deltas are input_json_delta');
+
+    assert.equal(events.filter((e) => e.type === 'message_stop').length, 1, 'exactly one message_stop');
+    const msgDeltas = events.filter((e) => e.type === 'message_delta');
+    assert.equal(msgDeltas.length, 1, 'exactly one message_delta');
+    assert.equal(msgDeltas[0].obj.delta.stop_reason, 'tool_use');
+});
+
+// ---------------------------------------------------------------------------
+// Unit — SSE.b: finish_reason chunk then [DONE] -> exactly one message_stop, one message_delta (C3)
+// ---------------------------------------------------------------------------
+
+test('Unit — SSE.b: finish_reason then [DONE] -> exactly one message_stop and message_delta (C3)', () => {
+    const { makeSSETranslator } = requireFreshProxy({});
+    const events = [];
+    const sse = makeSSETranslator('composer-2.5', (type, obj) => events.push({ type, obj }));
+
+    sse.feed('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}\n\n');
+    sse.feed('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+    sse.feed('data: [DONE]\n\n');
+
+    assert.equal(events.filter((e) => e.type === 'message_stop').length, 1, 'exactly ONE message_stop (C3 idempotent)');
+    const msgDeltas = events.filter((e) => e.type === 'message_delta');
+    assert.equal(msgDeltas.length, 1, 'exactly ONE message_delta');
+    assert.equal(msgDeltas[0].obj.delta.stop_reason, 'end_turn');
+});
+
+// ---------------------------------------------------------------------------
+// Unit — SSE.c: trailing {choices:[],usage:{...}} -> no throw, usage captured (C4)
+// ---------------------------------------------------------------------------
+
+test('Unit — SSE.c: trailing usage-only chunk -> no throw, usage captured in message_delta (C4)', () => {
+    const { makeSSETranslator } = requireFreshProxy({});
+    const events = [];
+    const sse = makeSSETranslator('composer-2.5', (type, obj) => events.push({ type, obj }));
+
+    sse.feed('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}\n\n');
+    sse.feed('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+    // Trailing usage-only chunk (choices:[]) — must not throw
+    sse.feed('data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":42}}\n\n');
+    sse.feed('data: [DONE]\n\n');
+
+    const msgDeltas = events.filter((e) => e.type === 'message_delta');
+    assert.equal(msgDeltas.length, 1, 'exactly one message_delta');
+    assert.equal(msgDeltas[0].obj.usage.output_tokens, 42, 'completion_tokens captured from trailing usage chunk (C4)');
+    assert.equal(events.filter((e) => e.type === 'message_stop').length, 1, 'exactly one message_stop');
+});
+
+// ---------------------------------------------------------------------------
+// Unit — SSE.d: text-then-tool -> text@0, tool@1, matched start/stop (C2)
+// ---------------------------------------------------------------------------
+
+test('Unit — SSE.d: text-then-tool interleave -> text@0, tool@1, matched start/stop (C2)', () => {
+    const { makeSSETranslator } = requireFreshProxy({});
+    const events = [];
+    const sse = makeSSETranslator('composer-2.5', (type, obj) => events.push({ type, obj }));
+
+    // Text first
+    sse.feed('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"I will read that."},"finish_reason":null}]}\n\n');
+    // Then tool call
+    sse.feed('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_001","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}\n\n');
+    sse.feed('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"/foo\\"}"}}]},"finish_reason":null}]}\n\n');
+    sse.feed('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+    sse.feed('data: [DONE]\n\n');
+
+    const starts = events.filter((e) => e.type === 'content_block_start');
+    assert.equal(starts.length, 2, 'two content_block_start events');
+    assert.equal(starts[0].obj.index, 0, 'text block at index 0 (C2)');
+    assert.equal(starts[0].obj.content_block.type, 'text', 'first block is text');
+    assert.equal(starts[1].obj.index, 1, 'tool_use block at index 1 (C2)');
+    assert.equal(starts[1].obj.content_block.type, 'tool_use', 'second block is tool_use');
+
+    const stops = events.filter((e) => e.type === 'content_block_stop');
+    assert.equal(stops.length, 2, 'two content_block_stop events (matched)');
+    assert.deepEqual(stops.map((s) => s.obj.index).sort((a, b) => a - b), [0, 1], 'indices 0 and 1 both closed');
+});
+
+// ---------------------------------------------------------------------------
+// Unit — SSE.e: args-only delta first, then name-bearing delta -> deferred open (AC6)
+// ---------------------------------------------------------------------------
+
+test('Unit — SSE.e: deferred tool open — content_block_start only emitted once name known (AC6)', () => {
+    const { makeSSETranslator } = requireFreshProxy({});
+    const events = [];
+    const sse = makeSSETranslator('composer-2.5', (type, obj) => events.push({ type, obj }));
+
+    // First delta: tc.index=0, id present, but NO function.name (args-only)
+    sse.feed('data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_007","type":"function","function":{"arguments":"{\\"path\\""}}]},"finish_reason":null}]}\n\n');
+
+    assert.equal(events.filter((e) => e.type === 'content_block_start').length, 0,
+        'no content_block_start before name is known (deferred open)');
+
+    // Second delta: carries the function.name
+    sse.feed('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":":\\"/foo.txt\\"}"}}]},"finish_reason":null}]}\n\n');
+
+    const starts = events.filter((e) => e.type === 'content_block_start');
+    assert.equal(starts.length, 1, 'exactly one content_block_start emitted once name known');
+    assert.equal(starts[0].obj.content_block.name, 'read_file');
+    assert.equal(starts[0].obj.index, 0, 'block allocated at index 0');
+
+    // Buffered args should have been flushed
+    const deltas = events.filter((e) => e.type === 'content_block_delta');
+    assert.ok(deltas.length >= 1, 'at least one input_json_delta after deferred open');
+    const allArgs = deltas.map((d) => d.obj.delta.partial_json).join('');
+    assert.ok(allArgs.includes('/foo.txt'), 'buffered pre-name args flushed after name known');
+
+    sse.feed('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+    sse.feed('data: [DONE]\n\n');
+
+    assert.equal(events.filter((e) => e.type === 'message_stop').length, 1, 'clean finalize');
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp1: composer-2.5 routes to composer mock (AC1)
+// ---------------------------------------------------------------------------
+
+test('Comp1 — composer-2.5 routes to composer mock, not Anthropic/LiteLLM (AC1)', async () => {
+    let composerCalled = false;
+    let composerPath = null;
+    let anthropicCalled = false;
+
+    const anthropic = await mockHttpsServer((req, res) => {
+        anthropicCalled = true;
+        res.end('{}');
+    });
+
+    const composer = await mockServer(async (req, res) => {
+        composerCalled = true;
+        composerPath = req.url;
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-comp1',
+            choices: [{ message: { role: 'assistant', content: 'Hello from Composer!', tool_calls: null }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 3 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-comp1',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    assert.equal(proxy.COMPOSER_ENABLED, true, 'COMPOSER_ENABLED is true');
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10 },
+        headers: { 'authorization': 'Bearer test-key-comp1', 'x-api-key': 'should-be-stripped' },
+    });
+
+    assert.equal(result.statusCode, 200, 'Got 200 from composer mock');
+    assert.equal(composerCalled, true, 'Composer mock was called (AC1)');
+    assert.equal(anthropicCalled, false, 'Anthropic NOT called (AC1)');
+    assert.equal(composerPath, '/opencodev2/v1/chat/completions', 'Correct composer route hit');
+
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'Response translated to Anthropic format');
+    assert.equal(body.content[0].text, 'Hello from Composer!');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp2b: composer-on/litellm-off, non-claude model -> Anthropic (C1 Fix A)
+// ---------------------------------------------------------------------------
+
+test('Comp2b — composer-on/litellm-off, non-claude gpt-5 -> Anthropic, no crash (C1/AC2)', async () => {
+    let anthropicCalled = false;
+    let composerCalled = false;
+
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        anthropicCalled = true;
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json', ...makeRateLimitHeaders(5, 5) });
+        res.end(JSON.stringify({ type: 'message', content: [] }));
+    });
+
+    const composer = await mockServer((req, res) => {
+        composerCalled = true;
+        res.end('{}');
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-comp2b',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        // LITELLM_URL deliberately omitted -> FEATURE_ENABLED=false
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'gpt-5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10 },
+        headers: { 'authorization': 'Bearer test-key-comp2b' },
+    });
+
+    assert.equal(result.statusCode, 200, 'Got 200 (no crash) for non-claude model with litellm off (C1 Fix A)');
+    assert.equal(anthropicCalled, true, 'Anthropic received the non-claude request (fell through to passthrough)');
+    assert.equal(composerCalled, false, 'Composer NOT called (model is gpt-5, not composer-*)');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp2c: composer-on/litellm-off, high quota, claude model -> 200 (C1 Fix B)
+// ---------------------------------------------------------------------------
+
+test('Comp2c — composer-on/litellm-off, high quota, claude-opus-4-7 -> 200 from Anthropic, no crash (C1)', async () => {
+    let anthropicCalled = false;
+
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        anthropicCalled = true;
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json', ...makeRateLimitHeaders(96, 50) });
+        res.end(JSON.stringify({ type: 'message', content: [] }));
+    });
+
+    const composer = await mockServer((req, res) => { res.end('{}'); });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-comp2c',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        // LITELLM_URL deliberately omitted -> FEATURE_ENABLED=false, litellmParsed=null
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+        REDIRECT_AT_5H_PCT: '90',
+    });
+
+    // Force high quotaState to exercise the shouldRedirect path (C1 Fix B critical path)
+    proxy._state.quotaState.fiveHourPct = 95;
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'claude-opus-4-7', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10 },
+        headers: { 'authorization': 'Bearer test-key-comp2c' },
+    });
+
+    assert.equal(result.statusCode, 200, 'Got 200 (no crash) — FEATURE_ENABLED guard skips redirect block (C1 Fix B)');
+    assert.equal(anthropicCalled, true, 'Anthropic received request — not erroneously redirected to null litellmParsed');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp10: non-streaming choices:[] -> 502 {type:'error'} (C4)
+// ---------------------------------------------------------------------------
+
+test('Comp10 — non-streaming choices:[] from composer -> 502 Anthropic error envelope, no crash (C4)', async () => {
+    const composer = await mockServer(async (req, res) => {
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 0 } }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-comp10',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10 },
+        headers: { 'authorization': 'Bearer test-key-comp10' },
+    });
+
+    assert.equal(result.statusCode, 502, 'Returns 502 when choices:[] (C4)');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'error', 'Anthropic error envelope has type:error');
+    assert.ok(body.error && body.error.message, 'Error envelope has error.message');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Auth/route: correct path + auth injection + inbound stripping (AC8)
+// ---------------------------------------------------------------------------
+
+test('Comp-auth — correct route, Bearer injected, inbound x-api-key/authorization stripped (AC8)', async () => {
+    let receivedHeaders = null;
+    let receivedPath = null;
+
+    const composer = await mockServer(async (req, res) => {
+        receivedHeaders = Object.assign({}, req.headers);
+        receivedPath = req.url;
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-auth',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'my-cursor-api-key',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 },
+        headers: {
+            'authorization': 'Bearer inbound-anthropic-key',
+            'x-api-key': 'inbound-x-api-key',
+        },
+    });
+
+    assert.ok(receivedHeaders !== null, 'Composer mock received the request');
+    assert.equal(receivedPath, '/opencodev2/v1/chat/completions', 'Fixed route POSTed (AC8)');
+    assert.equal(receivedHeaders['authorization'], 'Bearer my-cursor-api-key', 'Cursor API key injected (AC8)');
+    assert.ok(!receivedHeaders['x-api-key'], 'Inbound x-api-key stripped (AC8)');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Tool round-trip (AC7)
+// ---------------------------------------------------------------------------
+
+test('Comp-tool-roundtrip — tools + tool_use/tool_result history translates correctly (AC7)', async () => {
+    let composerReceivedBody = null;
+
+    const composer = await mockServer(async (req, res) => {
+        composerReceivedBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-rt',
+            choices: [{
+                message: {
+                    role: 'assistant', content: null,
+                    tool_calls: [{ id: 'call_roundtrip', type: 'function', function: { name: 'write_file', arguments: '{"path":"/out.txt","content":"hello"}' } }],
+                },
+                finish_reason: 'tool_calls',
+            }],
+            usage: { prompt_tokens: 20, completion_tokens: 10 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-rt',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: {
+            model: 'composer-2.5',
+            system: 'You are a coding assistant.',
+            messages: [
+                { role: 'user', content: 'Read the file.' },
+                { role: 'assistant', content: [{ type: 'tool_use', id: 'call_prev_001', name: 'read_file', input: { path: '/foo.txt' } }] },
+                { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_prev_001', content: 'file content here' }] },
+                { role: 'user', content: 'Now write the result.' },
+            ],
+            tools: [
+                { name: 'read_file',  description: 'Read',  input_schema: { type: 'object', properties: { path:    { type: 'string' } }, required: ['path'] } },
+                { name: 'write_file', description: 'Write', input_schema: { type: 'object', properties: { path:    { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
+            ],
+            max_tokens: 100,
+        },
+        headers: { 'authorization': 'Bearer test-key-rt' },
+    });
+
+    assert.equal(result.statusCode, 200, 'Tool round-trip returns 200');
+
+    // Verify request translation
+    const sent = JSON.parse(composerReceivedBody);
+    assert.equal(sent.messages[0].role, 'system', 'system message present');
+    assert.equal(sent.messages[0].content, 'You are a coding assistant.');
+
+    const assistantMsg = sent.messages.find((m) => m.role === 'assistant');
+    assert.ok(assistantMsg, 'assistant message present');
+    assert.equal(assistantMsg.tool_calls[0].id, 'call_prev_001', 'tool_use id verbatim (R2)');
+    assert.equal(assistantMsg.tool_calls[0].function.arguments, JSON.stringify({ path: '/foo.txt' }));
+    assert.equal(assistantMsg.content, null, 'content:null for tool-only assistant turn (M2)');
+
+    const toolMsg = sent.messages.find((m) => m.role === 'tool');
+    assert.ok(toolMsg, 'tool message present');
+    assert.equal(toolMsg.tool_call_id, 'call_prev_001', 'tool_call_id matches tool_use id (AC7)');
+    assert.equal(toolMsg.content, 'file content here');
+
+    assert.equal(sent.tools.length, 2, 'both tools translated');
+    assert.equal(sent.tools[0].type, 'function');
+    assert.equal(sent.tools[0].function.name, 'read_file');
+
+    // Verify response translation
+    const body = JSON.parse(result.body);
+    assert.equal(body.stop_reason, 'tool_use', 'stop_reason translated from finish_reason:tool_calls');
+    const toolUse = body.content.find((b) => b.type === 'tool_use');
+    assert.ok(toolUse, 'tool_use block in response');
+    assert.equal(toolUse.id, 'call_roundtrip');
+    assert.equal(toolUse.name, 'write_file');
+    assert.deepEqual(toolUse.input, { path: '/out.txt', content: 'hello' });
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — AC10: Composer does NOT write usage file / mutate quotaState
+// ---------------------------------------------------------------------------
+
+test('Comp-ac10 — Composer responses do NOT write usage file or mutate quotaState (AC10)', async () => {
+    const composer = await mockServer(async (req, res) => {
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-ac10',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 3 },
+        }));
+    });
+
+    const usageFileAC10 = path.join(os.tmpdir(), `proxy-test-ac10-${process.pid}.md`);
+    if (fs.existsSync(usageFileAC10)) fs.unlinkSync(usageFileAC10);
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-ac10',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
+        CLAUDE_USAGE_FILE: usageFileAC10,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const initialFiveH = proxy._state.quotaState.fiveHourPct;
+    const initialSevenD = proxy._state.quotaState.sevenDayPct;
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 5 },
+        headers: { 'authorization': 'Bearer test-key-ac10' },
+    });
+
+    assert.equal(result.statusCode, 200, 'Composer request succeeded');
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(fs.existsSync(usageFileAC10), false, 'Usage file NOT written for Composer call (AC10)');
+    assert.equal(proxy._state.quotaState.fiveHourPct, initialFiveH, 'quotaState.fiveHourPct NOT mutated (AC10)');
+    assert.equal(proxy._state.quotaState.sevenDayPct, initialSevenD, 'quotaState.sevenDayPct NOT mutated (AC10)');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Unit — SSE.f: fragmented data: line across two feed() calls (lineBuf retention)
+// ---------------------------------------------------------------------------
+
+test('Unit — SSE.f: data: line split mid-JSON across two feed() calls -> one coherent text delta', () => {
+    const { makeSSETranslator } = requireFreshProxy({});
+    const events = [];
+    const sse = makeSSETranslator('composer-2.5', (type, obj) => events.push({ type, obj }));
+
+    // Split the JSON payload of one SSE line across two separate feed() calls.
+    // The lineBuf must retain the partial fragment and join it on the second call.
+    sse.feed('data: {"id":"c1","choi');
+    // No complete line yet — no events expected
+    assert.equal(events.length, 0, 'no events emitted on incomplete line');
+
+    sse.feed('ces":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}\n\n');
+
+    const textDeltas = events.filter((e) => e.type === 'content_block_delta' && e.obj.delta.type === 'text_delta');
+    assert.equal(textDeltas.length, 1, 'exactly one text_delta after fragments rejoined');
+    assert.equal(textDeltas[0].obj.delta.text, 'hi', 'correct text from reassembled JSON fragment');
+
+    // Clean finalize to confirm state is coherent after fragmented feed
+    sse.feed('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+    sse.feed('data: [DONE]\n\n');
+
+    assert.equal(events.filter((e) => e.type === 'message_stop').length, 1, 'clean finalize after fragmented feed');
+    assert.equal(events.filter((e) => e.type === 'message_delta').length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp5: streaming text translation end-to-end (AC6)
+// ---------------------------------------------------------------------------
+
+test('Comp5 — streaming text translation end-to-end: ordered Anthropic SSE over the wire (AC6)', async () => {
+    const composer = await mockServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        // Two text deltas, then finish_reason, then [DONE]
+        res.write('data: {"id":"chatcmpl-s1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-comp5',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const { statusCode, contentType, body } = await new Promise((resolve, reject) => {
+        const parts = [];
+        const req = http.request({
+            hostname: '127.0.0.1',
+            port: proxyPort,
+            path: '/v1/messages',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'authorization': 'Bearer sk-comp5' },
+        }, (res) => {
+            const ct = res.headers['content-type'] || '';
+            res.on('data', (c) => parts.push(c.toString()));
+            res.on('end', () => resolve({ statusCode: res.statusCode, contentType: ct, body: parts.join('') }));
+        });
+        req.on('error', reject);
+        req.end(JSON.stringify({ model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], stream: true, max_tokens: 50 }));
+    });
+
+    assert.equal(statusCode, 200, 'streaming response is 200');
+    assert.ok(contentType.includes('text/event-stream'), 'content-type is text/event-stream (not buffered)');
+
+    // Parse the Anthropic SSE event sequence
+    const events = [];
+    let currentEvent = null;
+    for (const line of body.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('event: ')) {
+            currentEvent = { type: trimmed.slice(7) };
+            events.push(currentEvent);
+        } else if (trimmed.startsWith('data: ') && currentEvent) {
+            try { currentEvent.data = JSON.parse(trimmed.slice(6)); } catch { /* ignore */ }
+        }
+    }
+
+    const types = events.map((e) => e.type);
+
+    // Required ordering: message_start → content_block_start → content_block_delta → content_block_stop → message_delta → message_stop
+    assert.ok(types.includes('message_start'), 'message_start present');
+    assert.ok(types.includes('content_block_start'), 'content_block_start present');
+    assert.ok(types.includes('content_block_delta'), 'content_block_delta present');
+    assert.ok(types.includes('content_block_stop'), 'content_block_stop present');
+    assert.ok(types.includes('message_delta'), 'message_delta present');
+    assert.ok(types.includes('message_stop'), 'message_stop present');
+
+    const idx = (t) => types.indexOf(t);
+    assert.ok(idx('message_start') < idx('content_block_start'), 'message_start before content_block_start');
+    assert.ok(idx('content_block_start') < idx('content_block_delta'), 'content_block_start before content_block_delta');
+    assert.ok(idx('content_block_stop') < idx('message_delta'), 'content_block_stop before message_delta');
+    assert.ok(idx('message_delta') < idx('message_stop'), 'message_delta before message_stop');
+
+    // Verify text content
+    const textDeltas = events.filter((e) => e.type === 'content_block_delta' && e.data && e.data.delta && e.data.delta.type === 'text_delta');
+    assert.ok(textDeltas.length >= 1, 'at least one text_delta event');
+    const allText = textDeltas.map((e) => e.data.delta.text).join('');
+    assert.ok(allText.includes('Hello'), 'first text delta content present');
+
+    // message_start carries correct model
+    const msgStart = events.find((e) => e.type === 'message_start');
+    assert.equal(msgStart.data.message.model, 'composer-2.5', 'message_start.model is composer-2.5');
+
+    // message_delta carries stop_reason
+    const msgDelta = events.find((e) => e.type === 'message_delta');
+    assert.equal(msgDelta.data.delta.stop_reason, 'end_turn', 'stop_reason is end_turn');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp6: streaming tool-call round-trip (AC6/AC7)
+// ---------------------------------------------------------------------------
+
+test('Comp6 — streaming tool-call round-trip: tool_calls deltas -> input_json_delta -> tool_use (AC6/AC7)', async () => {
+    const composer = await mockServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        // Tool call: id+name in first delta, arguments fragment in second, finish_reason, [DONE]
+        res.write('data: {"id":"chatcmpl-tc1","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_stream_001","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"/src/main.js\\"}"}}]},"finish_reason":null}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-comp6',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const { statusCode, body } = await new Promise((resolve, reject) => {
+        const parts = [];
+        const req = http.request({
+            hostname: '127.0.0.1',
+            port: proxyPort,
+            path: '/v1/messages',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'authorization': 'Bearer sk-comp6' },
+        }, (res) => {
+            res.on('data', (c) => parts.push(c.toString()));
+            res.on('end', () => resolve({ statusCode: res.statusCode, body: parts.join('') }));
+        });
+        req.on('error', reject);
+        req.end(JSON.stringify({
+            model: 'composer-2.5',
+            messages: [{ role: 'user', content: 'read the file' }],
+            tools: [{ name: 'read_file', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }],
+            stream: true,
+            max_tokens: 50,
+        }));
+    });
+
+    assert.equal(statusCode, 200, 'streaming tool call returns 200');
+
+    // Parse events
+    const events = [];
+    let cur = null;
+    for (const line of body.split('\n')) {
+        const t = line.trim();
+        if (t.startsWith('event: ')) { cur = { type: t.slice(7) }; events.push(cur); }
+        else if (t.startsWith('data: ') && cur) { try { cur.data = JSON.parse(t.slice(6)); } catch { /* ignore */ } }
+    }
+
+    const types = events.map((e) => e.type);
+
+    // Tool-only: first content_block_start must be tool_use at index 0 (C2)
+    const firstStart = events.find((e) => e.type === 'content_block_start');
+    assert.ok(firstStart, 'content_block_start present');
+    assert.equal(firstStart.data.index, 0, 'tool_use at index 0 (C2)');
+    assert.equal(firstStart.data.content_block.type, 'tool_use', 'block type is tool_use');
+    assert.equal(firstStart.data.content_block.id, 'call_stream_001', 'tool_use id verbatim');
+    assert.equal(firstStart.data.content_block.name, 'read_file', 'tool_use name correct');
+
+    // input_json_delta(s) emitted
+    const jsonDeltas = events.filter((e) => e.type === 'content_block_delta' && e.data && e.data.delta && e.data.delta.type === 'input_json_delta');
+    assert.ok(jsonDeltas.length >= 1, 'at least one input_json_delta');
+    const allJson = jsonDeltas.map((e) => e.data.delta.partial_json).join('');
+    assert.ok(allJson.includes('/src/main.js'), 'arguments fragments contain the path');
+
+    // message_delta stop_reason is tool_use
+    const msgDelta = events.find((e) => e.type === 'message_delta');
+    assert.ok(msgDelta, 'message_delta present');
+    assert.equal(msgDelta.data.delta.stop_reason, 'tool_use', 'stop_reason is tool_use');
+
+    // Proper ordering
+    assert.ok(types.indexOf('content_block_start') < types.indexOf('content_block_stop'), 'start before stop');
+    assert.ok(types.indexOf('content_block_stop') < types.indexOf('message_delta'), 'stop before message_delta');
+    assert.ok(types.indexOf('message_delta') < types.indexOf('message_stop'), 'message_delta before message_stop');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration — Comp-encoding: response compression handling (regression)
+// Real-world AC13 bug: composer-api compressed the response (zstd) because the
+// inbound Claude Code request advertised it; the proxy buffered the compressed
+// bytes and JSON.parse failed -> 502 "invalid JSON". Fix: send
+// accept-encoding: identity upstream, plus defensive gzip/br/deflate decode.
+// ---------------------------------------------------------------------------
+
+test('Comp-encoding-identity — proxy requests identity encoding from composer (AC13 regression)', async () => {
+    let receivedAcceptEncoding = null;
+
+    const composer = await mockServer(async (req, res) => {
+        receivedAcceptEncoding = req.headers['accept-encoding'];
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-enc',
+            choices: [{ message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-enc',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        // Inbound client advertises compression, as Claude Code does in the wild.
+        headers: { 'accept-encoding': 'zstd, gzip, br' },
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 },
+    });
+
+    assert.equal(receivedAcceptEncoding, 'identity', 'proxy forces accept-encoding: identity upstream (not the inbound zstd/gzip/br)');
+    assert.equal(result.statusCode, 200, 'translated 200 returned');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'valid Anthropic message returned');
+    assert.equal(body.content[0].text, 'hi', 'content translated');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+test('Comp-encoding-gzip — proxy defensively decodes a gzipped composer response (AC13 regression)', async () => {
+    const zlib = require('node:zlib');
+
+    const composer = await mockServer(async (req, res) => {
+        await bufferBody(req);
+        const payload = Buffer.from(JSON.stringify({
+            id: 'chatcmpl-gz',
+            choices: [{ message: { role: 'assistant', content: 'decoded ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 2, completion_tokens: 3 },
+        }), 'utf8');
+        // Server ignores identity and gzips anyway — proxy must still decode.
+        res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip' });
+        res.end(zlib.gzipSync(payload));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-gz',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 },
+    });
+
+    assert.equal(result.statusCode, 200, 'gzipped upstream body decoded, not a 502');
+    const body = JSON.parse(result.body);
+    assert.equal(body.content[0].text, 'decoded ok', 'gzip-decoded content translated correctly');
+
+    await closeProxy(proxy);
+    await composer.close();
 });
