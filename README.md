@@ -14,7 +14,7 @@ The router has three capabilities that can be used independently:
 
 2. **LiteLLM fallback** — opt-in via `LITELLM_URL`. When any utilization window hits a configured threshold, `claude-*` requests are redirected to a local LiteLLM instance with the body's `model` field rewritten to a tier-matched substitute (`opus`, `sonnet`, `haiku`). Non-Anthropic models (`gpt-*`, `gemini-*`, etc.) always go to LiteLLM regardless of quota, with the body forwarded as-is.
 
-3. **Composer 2.5** — opt-in via `CURSOR_API_KEY`. Routes requests to Cursor's Composer 2.5 model via native Anthropic↔OpenAI translation, enabling Claude Code to use Composer as an alternative model alongside Anthropic and LiteLLM options. Switch by naming any model matching `composer-*` (e.g. `composer-2.5`).
+3. **Composer 2.5** — opt-in via `CURSOR_API_KEY`. Routes requests to Cursor's Composer 2.5 model via native Anthropic↔OpenAI translation, enabling Claude Code to use Composer as an alternative model alongside Anthropic and LiteLLM options. Switch by naming any model matching `composer-*` (e.g. `composer-2.5`). By default this talks to Cursor's backend directly so your key never leaves for a third party (see [Direct Cursor mode](#direct-cursor-mode-default)); set `CURSOR_DIRECT=0` to use the hosted relay instead.
 
 If both `LITELLM_URL` and `CURSOR_API_KEY` are unset, claude-router is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
 
@@ -196,6 +196,34 @@ The Composer feature activates only when `CURSOR_API_KEY` is set. All other vari
 - Image input is best-effort; some image formats may not round-trip perfectly.
 - Token usage is estimated by composer-api and displayed for reference only — it does not update the `~/.claude/usage-status.md` quota file.
 - Composer is **explicit-only** — it is never used as a quota fallback target when `LITELLM_URL` is configured. Name `composer-*` explicitly to route to Composer.
+
+### Direct Cursor mode (default)
+
+Composer requests talk to Cursor's AgentService backend (`api2.cursor.sh`) **directly** by default, so your API key never transits a third-party relay. The alternative — the hosted relay at `cursor-api.standardagents.ai`, which forwards your key to Cursor — is available by opting out.
+
+**Activation:** direct mode is **on by default** whenever `CURSOR_API_KEY` is set. To opt out and use the hosted relay instead, set `CURSOR_DIRECT=0`.
+
+**Configuration variables:**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `CURSOR_DIRECT` | Direct-mode routing. On by default when `CURSOR_API_KEY` is set; set to `0` to opt out (use the hosted relay). | `1` (on) |
+| `CURSOR_BACKEND_BASE_URL` | Cursor backend base URL. | `https://api2.cursor.sh` |
+| `CURSOR_LOCAL_AGENT_ENDPOINT` | Full URL to Cursor's AgentService/Run endpoint. **Must be a complete URL**, not host-only. | `https://api2.cursor.sh/agent.v1.AgentService/Run` |
+| `CURSOR_SDK_CLIENT_VERSION` | SDK client version string sent in request headers. | `sdk-1.0.13` |
+
+**How it works:** Requests are translated from Anthropic format to OpenAI format, then to Cursor's AgentService over HTTP/2 using ConnectRPC and protobuf encoding. The connection is bidirectional: the proxy sends a run request, Cursor's backend responds with text and tool data as protobuf interaction updates, and the proxy answers a mid-stream request-context handshake before continuing to receive tool and completion messages. Responses are translated back to Anthropic format. Streaming is fully supported. Tool-calling and images (best-effort) work as with the hosted relay.
+
+**Privacy:** In direct mode, your API key and prompts are sent only to `api2.cursor.sh` (Cursor). In hosted mode, they go to `cursor-api.standardagents.ai` which forwards them to Cursor. Neither mode sends data to the router itself.
+
+#### ⚠️ Caveats
+
+- **Impersonation:** Direct mode sends request headers identifying the client as an SDK instance (SDK client version `sdk-1.0.13`). This is necessary to reach Cursor's private AgentService backend, but it impersonates the Cursor SDK.
+- **Terms of Service:** Using direct mode may violate Cursor's Terms of Service. The user assumes all responsibility for compliance and any consequences of using this feature.
+- **Fragility:** The AgentService endpoint (`agent.v1.AgentService/Run`), protocol version, or client headers may change without notice. If Cursor updates any of these, direct mode may break (e.g., 502 or a Connect protocol error). The error message will name the `CURSOR_LOCAL_AGENT_ENDPOINT` env var so you can override it if needed.
+- **Best-effort:** Images are handled best-effort; some formats may not round-trip. Sampling parameters (`temperature`, `top_p`) are not honored by Cursor's backend.
+
+**Troubleshooting:** If you see a 502 error naming `CURSOR_LOCAL_AGENT_ENDPOINT`, the endpoint is not reachable or not recognized. Verify that `CURSOR_LOCAL_AGENT_ENDPOINT` points to the correct `agent.v1.AgentService/Run` URL, or file an issue with the raw error message from the logs.
 
 ## Routing reference
 

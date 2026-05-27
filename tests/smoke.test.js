@@ -15,6 +15,7 @@ const assert = require('node:assert/strict');
 const http = require('http');
 const https = require('https');
 const { spawn } = require('child_process');
+const http2 = require('node:http2');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -104,6 +105,19 @@ function mockServer(handler) {
     });
 }
 
+/** Start a mock HTTP/2 cleartext (h2c) server. handler(stream, headers) is called per stream. */
+function mockH2cServer(handler) {
+    return new Promise((resolve) => {
+        const server = http2.createServer();
+        server.on('stream', handler);
+        server.listen(0, '127.0.0.1', () => {
+            const { port } = server.address();
+            resolve({ server, port, close: () => new Promise((res) => server.close(res)) });
+        });
+        server.unref();
+    });
+}
+
 /** Send an HTTP request to the proxy. Returns a promise resolving to { statusCode, headers, body }. */
 function proxyRequest(proxyPort, opts = {}) {
     return new Promise((resolve, reject) => {
@@ -159,6 +173,9 @@ function requireFreshProxy(env = {}) {
         'REDIRECT_AT_OVERAGE_PCT', 'PROBE_INTERVAL_MS', 'MAX_BUFFER_BYTES',
         'ANTHROPIC_HOST_OVERRIDE', 'ANTHROPIC_API_KEY_FOR_PROBES', 'CLAUDE_USAGE_FILE',
         'CURSOR_API_KEY', 'COMPOSER_API_URL',
+        // Direct-Cursor transport env keys (must be reset between tests)
+        'CURSOR_DIRECT', 'CURSOR_BACKEND_BASE_URL', 'CURSOR_LOCAL_AGENT_ENDPOINT',
+        'CURSOR_SDK_CLIENT_VERSION', 'ENCRYPTION_KEY',
     ];
     const saved = {};
     for (const k of keys) {
@@ -1419,6 +1436,7 @@ test('Comp1 — composer-2.5 routes to composer mock, not Anthropic/LiteLLM (AC1
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-key-comp1',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -1594,6 +1612,7 @@ test('Comp-auth — correct route, Bearer injected, inbound x-api-key/authorizat
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'my-cursor-api-key',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -1644,6 +1663,7 @@ test('Comp-tool-roundtrip — tools + tool_use/tool_result history translates co
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-key-rt',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -1726,6 +1746,7 @@ test('Comp-ac10 — Composer responses do NOT write usage file or mutate quotaSt
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-key-ac10',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
         CLAUDE_USAGE_FILE: usageFileAC10,
@@ -1800,6 +1821,7 @@ test('Comp5 — streaming text translation end-to-end: ordered Anthropic SSE ove
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-key-comp5',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -1892,6 +1914,7 @@ test('Comp6 — streaming tool-call round-trip: tool_calls deltas -> input_json_
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-key-comp6',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:19999`,
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -1987,6 +2010,7 @@ test('Comp-encoding-identity — proxy requests identity encoding from composer 
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-enc',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -2027,6 +2051,7 @@ test('Comp-encoding-gzip — proxy defensively decodes a gzipped composer respon
 
     const proxy = requireFreshProxy({
         CURSOR_API_KEY: 'cursor-gz',
+        CURSOR_DIRECT: '0', // hosted-relay test — opt out of default direct mode
         COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
         ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
@@ -2044,4 +2069,1960 @@ test('Comp-encoding-gzip — proxy defensively decodes a gzipped composer respon
 
     await closeProxy(proxy);
     await composer.close();
+});
+
+// ============================================================================
+// Direct-Cursor test helpers (test-only proto codec, frame builders, etc.)
+// These are INDEPENDENT of proxy.js — they only build payloads for mock servers.
+// ============================================================================
+
+// Minimal varint encoder for building test proto payloads.
+function tcEncodeVarint(n) {
+    const out = [];
+    let v = typeof n === 'bigint' ? n : BigInt(Math.floor(Number(n)));
+    do {
+        const byte = Number(v & 0x7Fn);
+        v >>= 7n;
+        out.push(v > 0n ? byte | 0x80 : byte);
+    } while (v > 0n);
+    return new Uint8Array(out.length ? out : [0]);
+}
+
+// Minimal varint decoder: returns { value: BigInt, offset: number }.
+function tcDecodeVarint(bytes, offset) {
+    let result = 0n, shift = 0n;
+    while (offset < bytes.length) {
+        const byte = bytes[offset++];
+        result |= BigInt(byte & 0x7F) << shift;
+        shift += 7n;
+        if ((byte & 0x80) === 0) break;
+    }
+    return { value: result, offset };
+}
+
+// Concatenate multiple Uint8Arrays.
+function tcConcat(...arrays) {
+    let total = 0;
+    for (const a of arrays) total += a.length;
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (const a of arrays) { out.set(a, pos); pos += a.length; }
+    return out;
+}
+
+// Build a protobuf field (wire type 0=varint, 2=len-delim).
+function tcProtoField(fieldNo, wt, value) {
+    const tag = tcEncodeVarint((fieldNo << 3) | wt);
+    if (wt === 0) return tcConcat(tag, tcEncodeVarint(value));
+    const bytes = typeof value === 'string' ? new TextEncoder().encode(value)
+                : value instanceof Uint8Array ? value
+                : tcEncodeVarint(value);
+    return tcConcat(tag, tcEncodeVarint(bytes.length), bytes);
+}
+
+// Build a Connect protocol frame (5-byte header: flags + big-endian uint32 length).
+// Use flags=0 for data frames, flags=2 for end-stream trailer frames.
+function tcConnectFrame(payload, flags) {
+    const f = flags || 0;
+    const frame = new Uint8Array(5 + payload.length);
+    frame[0] = f;
+    const len = payload.length;
+    frame[1] = (len >>> 24) & 0xFF;
+    frame[2] = (len >>> 16) & 0xFF;
+    frame[3] = (len >>> 8) & 0xFF;
+    frame[4] = len & 0xFF;
+    frame.set(payload, 5);
+    return frame;
+}
+
+// Build a Cursor chat response text frame: field 2 → inner field 1 = text string.
+function tcTextFrame(text) {
+    const inner = tcProtoField(1, 2, text);
+    const outer = tcProtoField(2, 2, inner);
+    return tcConnectFrame(outer);
+}
+
+// Build a Connect end-stream trailer frame (flags=2).
+// Pass errorObj = { error: { message: '...' } } to trigger a throw in handleEndStreamFrame.
+// Pass null/undefined for a clean end-stream (no error).
+function tcEndStreamFrame(errorObj) {
+    const payload = errorObj
+        ? new TextEncoder().encode(JSON.stringify(errorObj))
+        : new Uint8Array(0);
+    return tcConnectFrame(payload, 2);
+}
+
+// Strip the 5-byte Connect header from a frame buffer; returns raw payload Uint8Array.
+function tcPayload(frameBytes) {
+    const b = frameBytes instanceof Uint8Array ? frameBytes
+        : new Uint8Array(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
+    return b.length >= 5 ? b.slice(5) : new Uint8Array(0);
+}
+
+// AgentService text frame: outer field 1 (interactionUpdate) → field 1 (textUpdate) → field 1 = text.
+// Mirrors decodeInteractionUpdate field-1 path in proxy.js.
+function tcInteractionTextFrame(text) {
+    const textSub = tcProtoField(1, 2, text);
+    const interactionUpdate = tcProtoField(1, 2, textSub);
+    const payload = tcProtoField(1, 2, interactionUpdate);
+    return tcConnectFrame(payload);
+}
+
+// AgentService done frame: outer field 1 (interactionUpdate) → field 14 (wire 2, empty bytes).
+// Field 14 MUST be wire type 2 (len-delim) to pass the !(value instanceof Uint8Array) guard.
+function tcDoneFrame() {
+    const interactionUpdate = tcProtoField(14, 2, new Uint8Array(0));
+    const payload = tcProtoField(1, 2, interactionUpdate);
+    return tcConnectFrame(payload);
+}
+
+// AgentService request_context frame: outer field 2 (execServerMessage).
+// Presence of field 10 (bytes) signals request_context in decodeExecServerMessage.
+function tcRequestContextFrame(id, execId) {
+    const execMsg = tcConcat(
+        tcProtoField(1, 0, id),                       // field 1 varint = id
+        tcProtoField(15, 2, execId),                  // field 15 string = execId
+        tcProtoField(10, 2, new Uint8Array(0)),        // field 10 bytes (request_context marker)
+    );
+    const payload = tcProtoField(2, 2, execMsg);
+    return tcConnectFrame(payload);
+}
+
+// AgentService shell tool-call frame: outer field 1 (interactionUpdate) → field 2 (toolCallUpdate).
+// Uses TOOL_CALL_SPECS[1] (shell) so isEmittableSdkToolCall returns true for a non-empty command.
+function tcShellToolFrame(callId, command) {
+    const argsBytes = tcProtoField(1, 2, command);            // shell args: field 1 = command
+    const shellSpec = tcProtoField(1, 2, argsBytes);          // inner shell spec: field 1 = argsBytes
+    const toolCallBytes = tcProtoField(1, 2, shellSpec);      // TOOL_CALL_SPECS key 1 = shell
+    const toolCallUpdate = tcConcat(
+        tcProtoField(1, 2, callId),                           // field 1 = callId
+        tcProtoField(2, 2, toolCallBytes),                    // field 2 = toolCallBytes
+    );
+    const interactionUpdate = tcProtoField(2, 2, toolCallUpdate); // field 2 = toolCallUpdate
+    const payload = tcProtoField(1, 2, interactionUpdate);
+    return tcConnectFrame(payload);
+}
+
+// Decode proto fields from raw bytes: returns array of { no, wt, value }.
+function tcDecodeFields(bytes) {
+    const fields = [];
+    let offset = 0;
+    while (offset < bytes.length) {
+        if (offset >= bytes.length) break;
+        const { value: tag, offset: o1 } = tcDecodeVarint(bytes, offset);
+        offset = o1;
+        const fieldNo = Number(tag >> 3n);
+        const wt = Number(tag & 7n);
+        if (wt === 0) {
+            const { value, offset: o2 } = tcDecodeVarint(bytes, offset);
+            offset = o2;
+            fields.push({ no: fieldNo, wt, value });
+        } else if (wt === 2) {
+            const { value: len, offset: o2 } = tcDecodeVarint(bytes, offset);
+            offset = o2;
+            const n = Number(len);
+            fields.push({ no: fieldNo, wt, value: bytes.slice(offset, offset + n) });
+            offset += n;
+        } else if (wt === 5) {
+            offset += 4;
+        } else if (wt === 1) {
+            offset += 8;
+        } else {
+            break;
+        }
+    }
+    return fields;
+}
+
+// Create a Web ReadableStream from binary data (Uint8Array or Node Buffer).
+function tcWebStream(data) {
+    const bytes = data instanceof Uint8Array
+        ? data
+        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } });
+}
+
+// Combine Uint8Array / Buffer parts into a single Node Buffer for HTTP mock responses.
+function tcCombine(...parts) {
+    return Buffer.concat(parts.map(p => p instanceof Uint8Array ? Buffer.from(p) : p));
+}
+
+// Extract prompt text from a raw AgentService run-request Connect frame.
+// Walks: outer field 1 (runRequest) → field 2 (conversationAction) →
+//        field 1 (userMessageAction) → field 1 (userMessage) → field 1 (prompt text).
+function tcExtractPromptText(bodyBuf) {
+    const bytes = new Uint8Array(bodyBuf.buffer, bodyBuf.byteOffset, bodyBuf.byteLength);
+    if (bytes.length < 5) return '';
+    const len = new DataView(bytes.buffer, bytes.byteOffset + 1, 4).getUint32(0, false);
+    const payload = bytes.slice(5, 5 + len);
+    // outer: field 1 = runRequest
+    const f1 = tcDecodeFields(payload).find(f => f.no === 1 && f.wt === 2);
+    if (!f1) return '';
+    // runRequest: field 2 = conversationAction
+    const f2 = tcDecodeFields(f1.value).find(f => f.no === 2 && f.wt === 2);
+    if (!f2) return '';
+    // conversationAction: field 1 = userMessageAction
+    const f3 = tcDecodeFields(f2.value).find(f => f.no === 1 && f.wt === 2);
+    if (!f3) return '';
+    // userMessageAction: field 1 = userMessage
+    const f4 = tcDecodeFields(f3.value).find(f => f.no === 1 && f.wt === 2);
+    if (!f4) return '';
+    // userMessage: field 1 = prompt text
+    const f5 = tcDecodeFields(f4.value).find(f => f.no === 1 && f.wt === 2);
+    if (!f5) return '';
+    return new TextDecoder().decode(f5.value);
+}
+
+// Parse Anthropic SSE events from a raw response body string.
+function tcParseSSE(body) {
+    const events = [];
+    let cur = null;
+    for (const line of body.split('\n')) {
+        const t = line.trim();
+        if (t.startsWith('event: ')) { cur = { type: t.slice(7) }; events.push(cur); }
+        else if (t.startsWith('data: ') && cur) {
+            try { cur.data = JSON.parse(t.slice(6)); } catch { /* ignore */ }
+        }
+    }
+    return events;
+}
+
+// Send a streaming SSE request to the proxy and buffer the full body.
+function sseRequest(proxyPort, bodyObj) {
+    return new Promise((resolve, reject) => {
+        const parts = [];
+        const bodyBuf = Buffer.from(JSON.stringify(bodyObj));
+        const req = http.request({
+            hostname: '127.0.0.1', port: proxyPort,
+            path: '/v1/messages', method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'authorization': 'Bearer test-key-cd',
+                'content-length': String(bodyBuf.length),
+                'connection': 'close',
+            },
+        }, (res) => {
+            res.on('data', c => parts.push(c.toString()));
+            res.on('end', () => resolve({ statusCode: res.statusCode, body: parts.join('') }));
+        });
+        req.on('error', reject);
+        req.end(bodyBuf);
+    });
+}
+
+// ============================================================================
+// O1 — encodeConnectFrame byte layout + varint correctness via frame sizes
+// ============================================================================
+
+test('O1 — encodeConnectFrame: 5-byte prefix layout (flags=0, big-endian uint32 length)', () => {
+    const proxy = requireFreshProxy({});
+    const { encodeConnectFrame } = proxy;
+
+    // Empty payload → 5-byte header only
+    const empty = encodeConnectFrame(new Uint8Array(0));
+    assert.equal(empty.length, 5, 'empty payload → 5-byte frame');
+    assert.equal(empty[0], 0, 'flags=0');
+    assert.deepEqual([...empty.slice(1)], [0, 0, 0, 0], 'length=0 big-endian');
+
+    // 1-byte payload: [0x0A]
+    const f1 = encodeConnectFrame(new Uint8Array([0x0A]));
+    assert.deepEqual([...f1], [0x00, 0x00, 0x00, 0x00, 0x01, 0x0A], '1-byte payload frame correct');
+
+    // 300-byte payload: length 0x0000012C in big-endian
+    const big = new Uint8Array(300).fill(0xBB);
+    const f300 = encodeConnectFrame(big);
+    assert.equal(f300.length, 305);
+    assert.equal(f300[0], 0, 'flags=0 for data frame');
+    assert.equal(f300[1], 0); assert.equal(f300[2], 0);
+    assert.equal(f300[3], 1);    // 300 = 0x12C → bytes [0,0,1,0x2C]
+    assert.equal(f300[4], 0x2C);
+    assert.ok([...f300.slice(5)].every(b => b === 0xBB), 'payload preserved verbatim');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// O2' — encodeAgentClientRunRequest field-number correctness + proto wrappers
+// ============================================================================
+
+test('O2\' — encodeAgentClientRunRequest: field numbers correct; undefined-safe proto wrappers', () => {
+    const proxy = requireFreshProxy({});
+    const { encodeAgentClientRunRequest, protoStringField, protoVarintField, protoMessageField } = proxy;
+
+    // Proto wrappers must be exported and return Uint8Arrays
+    const strBytes = protoStringField(1, 'test');
+    assert.ok(strBytes instanceof Uint8Array, 'protoStringField returns Uint8Array');
+    assert.ok(strBytes.length > 0, 'protoStringField result is non-empty');
+
+    // undefined-safe: protoStringField(n, undefined) must emit zero bytes (no field)
+    const strUndef = protoStringField(1, undefined);
+    assert.ok(strUndef instanceof Uint8Array, 'protoStringField(n,undefined) returns Uint8Array');
+    assert.equal(strUndef.length, 0, 'protoStringField(n,undefined) returns empty bytes');
+
+    const varUndef = protoVarintField(1, undefined);
+    assert.ok(varUndef instanceof Uint8Array, 'protoVarintField(n,undefined) returns Uint8Array');
+    assert.equal(varUndef.length, 0, 'protoVarintField(n,undefined) returns empty bytes');
+
+    // Encode and verify key field numbers
+    const result = encodeAgentClientRunRequest({
+        prompt: 'hello world',
+        messageId: 'msg-1',
+        modelId: 'cursor-small',
+        agentId: 'agent-test-id',
+    });
+    assert.ok(result instanceof Uint8Array, 'encodeAgentClientRunRequest returns Uint8Array');
+    assert.ok(result.length > 0, 'encoded result is non-empty');
+
+    // Outer wrapper: field 1 (wire 2) = runRequest
+    const outer = tcDecodeFields(result);
+    const runRequestField = outer.find(f => f.no === 1 && f.wt === 2);
+    assert.ok(runRequestField, 'outer field 1 (runRequest) present');
+
+    // Inside runRequest
+    const runFields = tcDecodeFields(runRequestField.value);
+    assert.ok(runFields.find(f => f.no === 2 && f.wt === 2), 'runRequest field 2 (conversationAction) present');
+    assert.ok(runFields.find(f => f.no === 5 && f.wt === 2), 'runRequest field 5 (agentId) present');
+    const field13 = runFields.find(f => f.no === 13 && f.wt === 2);
+    assert.ok(field13, 'runRequest field 13 (client type) present');
+    assert.equal(new TextDecoder().decode(field13.value), 'sdk', 'field 13 value is "sdk"');
+
+    // Verify prompt text deep in the hierarchy
+    const convAction = runFields.find(f => f.no === 2 && f.wt === 2);
+    const userMsgAction = tcDecodeFields(convAction.value).find(f => f.no === 1 && f.wt === 2);
+    assert.ok(userMsgAction, 'userMessageAction (conversationAction.field1) present');
+    const userMsg = tcDecodeFields(userMsgAction.value).find(f => f.no === 1 && f.wt === 2);
+    assert.ok(userMsg, 'userMessage (userMessageAction.field1) present');
+    const promptField = tcDecodeFields(userMsg.value).find(f => f.no === 1 && f.wt === 2);
+    assert.ok(promptField, 'prompt text field (userMessage.field1) present');
+    assert.equal(new TextDecoder().decode(promptField.value), 'hello world', 'prompt text encoded correctly');
+
+    closeProxy(proxy);
+});
+
+// O3 — deleted: cursorChecksum removed (HMAC-based ChatService auth gone;
+//      AgentService/Run uses Bearer token only). proto wrappers covered by O2' above.
+
+// ============================================================================
+// O4' — decodeLocalAgentServerFrame: text / done / request_context / tool_call
+// ============================================================================
+
+test('O4\' — decodeLocalAgentServerFrame: text, done, request_context, and tool_call events', () => {
+    const proxy = requireFreshProxy({});
+    const { decodeLocalAgentServerFrame } = proxy;
+
+    // --- Text frame ---
+    const textPayload = tcPayload(tcInteractionTextFrame('hello from agent'));
+    const textEvents = decodeLocalAgentServerFrame(textPayload);
+    assert.equal(textEvents.length, 1, 'text frame yields exactly one event');
+    assert.equal(textEvents[0].type, 'text', 'text event type is "text"');
+    assert.equal(textEvents[0].text, 'hello from agent', 'text value round-trips');
+
+    // --- Done frame ---
+    const donePayload = tcPayload(tcDoneFrame());
+    const doneEvents = decodeLocalAgentServerFrame(donePayload);
+    assert.equal(doneEvents.length, 1, 'done frame yields exactly one event');
+    assert.equal(doneEvents[0].type, 'done', 'done event type is "done"');
+
+    // --- request_context frame ---
+    const rcPayload = tcPayload(tcRequestContextFrame(7, 'exec-xyz'));
+    const rcEvents = decodeLocalAgentServerFrame(rcPayload);
+    assert.equal(rcEvents.length, 1, 'request_context frame yields exactly one event');
+    assert.equal(rcEvents[0].type, 'request_context', 'type is "request_context"');
+    assert.equal(rcEvents[0].id, 7, 'id decoded correctly');
+    assert.equal(rcEvents[0].execId, 'exec-xyz', 'execId decoded correctly');
+
+    // --- Shell tool-call frame ---
+    const toolPayload = tcPayload(tcShellToolFrame('call-id-1', 'echo hi'));
+    const toolEvents = decodeLocalAgentServerFrame(toolPayload);
+    assert.equal(toolEvents.length, 1, 'tool_call frame yields exactly one event');
+    assert.equal(toolEvents[0].type, 'tool_call', 'type is "tool_call"');
+    assert.equal(toolEvents[0].toolCall.name, 'shell', 'tool name is "shell"');
+    assert.equal(toolEvents[0].toolCall.arguments.command, 'echo hi', 'command arg decoded correctly');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// O5 — getAccessToken: exchange + cache + invalidate
+// ============================================================================
+
+test('O5 — getAccessToken: exchange, cache hit, invalidate + re-exchange', async () => {
+    let exchangeCount = 0;
+    const tokenServer = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            exchangeCount++;
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: `AT-${exchangeCount}` }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'test-api-key-o5',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenServer.port}`,
+        ENCRYPTION_KEY: 'composer-api',
+    });
+    const { getAccessToken, invalidateAccessToken, _accessTokenState } = proxy;
+    _accessTokenState.cache.clear();
+    _accessTokenState.inflight.clear();
+
+    // First call — cold start, triggers exchange
+    const t1 = await getAccessToken('test-api-key-o5');
+    assert.equal(t1, 'AT-1', 'first call returns AT-1');
+    assert.equal(exchangeCount, 1, 'exactly one exchange on cold start');
+
+    // Second call — should hit cache, no exchange
+    const t2 = await getAccessToken('test-api-key-o5');
+    assert.equal(t2, 'AT-1', 'second call returns same token from cache');
+    assert.equal(exchangeCount, 1, 'no additional exchange on cache hit');
+
+    // Invalidate then call again — triggers a new exchange
+    await invalidateAccessToken('test-api-key-o5');
+    const t3 = await getAccessToken('test-api-key-o5');
+    assert.equal(t3, 'AT-2', 'post-invalidation call exchanges again');
+    assert.equal(exchangeCount, 2, 'exactly two exchanges total');
+
+    await tokenServer.close();
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// O6 — parseComposerToolCalls: keyed-arg form, JSON-object body form, fullwidth charset
+// ============================================================================
+
+test('O6 — parseComposerToolCalls: ASCII keyed-arg, JSON-object body, and fullwidth ｜/▁ variants', () => {
+    const proxy = requireFreshProxy({});
+    const { parseComposerToolCalls } = proxy;
+
+    // (a) ASCII keyed-arg form — the model follows the injected marker grammar exactly
+    const asciiKeyed = [
+        '<|tool_calls_begin|><|tool_call_begin|>read_file',
+        '<|tool_sep|>path',
+        '/foo/bar.txt',
+        '<|tool_call_end|><|tool_calls_end|>',
+    ].join('\n');
+    const r1 = parseComposerToolCalls(asciiKeyed);
+    assert.ok(Array.isArray(r1) && r1.length >= 1, 'keyed-arg: parsed to non-empty array');
+    assert.equal(r1[0].name, 'read_file', 'keyed-arg: name is read_file');
+    assert.equal(r1[0].arguments.path, '/foo/bar.txt', 'keyed-arg: path argument correct');
+
+    // (b) JSON-object body form — model emits JSON instead of keyed-arg
+    const jsonBody = [
+        '<|tool_calls_begin|><|tool_call_begin|>',
+        JSON.stringify({ name: 'write_file', arguments: { path: '/out.txt', content: 'hello' } }),
+        '<|tool_call_end|><|tool_calls_end|>',
+    ].join('');
+    const r2 = parseComposerToolCalls(jsonBody);
+    assert.ok(r2.length >= 1, 'JSON-object body: parsed to non-empty array');
+    assert.equal(r2[0].name, 'write_file', 'JSON-object: name is write_file');
+    assert.deepEqual(r2[0].arguments, { path: '/out.txt', content: 'hello' },
+        'JSON-object: arguments match');
+
+    // (c) Fullwidth ｜/▁ charset variant — model sometimes emits Unicode lookalikes
+    const fullwidth = [
+        '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>bash',
+        '<｜tool▁sep｜>command',
+        'npm test',
+        '<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+    ].join('\n');
+    const r3 = parseComposerToolCalls(fullwidth);
+    assert.ok(r3.length >= 1, 'fullwidth variant: parsed to non-empty array');
+    assert.equal(r3[0].name, 'bash', 'fullwidth: name is bash');
+    const cmd = r3[0].arguments.command != null ? r3[0].arguments.command : r3[0].arguments.cmd;
+    assert.ok(String(cmd).includes('npm test'),
+        `fullwidth: command arg includes "npm test"; got: ${JSON.stringify(r3[0].arguments)}`);
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// O7 — openaiToCursorPrompt: history flatten (system + turns + tool message)
+// ============================================================================
+
+test('O7 — openaiToCursorPrompt: history flattened to prompt.text with correct role prefixes', () => {
+    const proxy = requireFreshProxy({});
+    const { openaiToCursorPrompt } = proxy;
+
+    const openaiBody = {
+        model: 'composer-2.5',
+        messages: [
+            { role: 'system', content: 'Be concise.' },
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi there' },
+            { role: 'tool', tool_call_id: 'call_abc', name: 'read_file', content: 'file contents here' },
+        ],
+    };
+
+    const result = openaiToCursorPrompt(openaiBody);
+    const text = result.prompt.text;
+
+    // No tools → mode is ask
+    assert.equal(result.prompt.mode, 'ask', 'no tools → mode is ask');
+    assert.ok(text.includes('Conversation:'), 'Conversation: separator present');
+    assert.ok(text.includes('SYSTEM: Be concise.'), 'system message with SYSTEM: prefix');
+    assert.ok(text.includes('USER: Hello'), 'user message with USER: prefix');
+    assert.ok(text.includes('ASSISTANT: Hi there'), 'assistant message with ASSISTANT: prefix');
+    assert.ok(text.includes('TOOL RESULT'), 'tool message rendered as TOOL RESULT');
+    assert.ok(text.includes('file contents here'), 'tool result content present');
+    assert.ok(text.includes('read_file'), 'tool name appears in TOOL RESULT label');
+
+    // No tools → SYSTEM_DIRECTIVE (not TOOL_SYSTEM_DIRECTIVE)
+    assert.ok(!text.includes('CLIENT TOOL INVENTORY:'), 'no tool inventory when tools absent');
+    assert.ok(text.includes('You are serving an OpenAI-compatible API request'), 'system directive preamble present');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// O8 — openaiToCursorPrompt tool injection (CRITICAL: tools must enter prompt.text)
+// ============================================================================
+
+test('O8 — openaiToCursorPrompt: tool schemas injected into prompt.text with full marker grammar', () => {
+    const proxy = requireFreshProxy({});
+    const { openaiToCursorPrompt } = proxy;
+
+    const tools = [
+        { type: 'function', function: { name: 'read_file', description: 'Read a file',
+            parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+        { type: 'function', function: { name: 'write_file', description: 'Write a file',
+            parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } } } } },
+    ];
+    const result = openaiToCursorPrompt({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'do something' }],
+        tools,
+    });
+    const text = result.prompt.text;
+
+    // Agent mode
+    assert.equal(result.prompt.mode, 'agent', 'tools present → mode is agent');
+    assert.ok(result.tools.length === 2, 'shaped.tools has 2 entries');
+
+    // TOOL_SYSTEM_DIRECTIVE preamble
+    assert.ok(text.includes('CLIENT TOOL INVENTORY:'), 'CLIENT TOOL INVENTORY: header present');
+    assert.ok(text.includes('Allowed tool names: read_file, write_file'), 'allowed tool names listed');
+
+    // Marker worked-example lines (verbatim — wording is prompt-conditioned)
+    assert.ok(text.includes('<|tool_calls_begin|><|tool_call_begin|>'), '<|tool_calls_begin|> example present');
+    assert.ok(text.includes('<|tool_sep|>'), '<|tool_sep|> example present');
+    assert.ok(text.includes('<|tool_call_end|><|tool_calls_end|>'), 'closing markers present');
+
+    // Per-tool JSON (one line per tool)
+    assert.ok(text.includes('"read_file"'), 'read_file JSON line present');
+    assert.ok(text.includes('"write_file"'), 'write_file JSON line present');
+
+    // tool_choice: required
+    const reqResult = openaiToCursorPrompt({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'q' }],
+        tools, tool_choice: 'required',
+    });
+    assert.ok(reqResult.prompt.text.includes('You must call at least one tool.'),
+        'tool_choice=required → must-call line injected');
+
+    // tool_choice: named function
+    const namedResult = openaiToCursorPrompt({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'q' }],
+        tools, tool_choice: { type: 'function', function: { name: 'read_file' } },
+    });
+    assert.ok(namedResult.prompt.text.includes('Use the read_file tool if you call a tool.'),
+        'named tool_choice → use-specific line injected');
+
+    // tool_choice: none → tools emptied, ask mode
+    const noneResult = openaiToCursorPrompt({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'q' }],
+        tools, tool_choice: 'none',
+    });
+    assert.equal(noneResult.prompt.mode, 'ask', 'tool_choice=none → mode is ask (tools suppressed)');
+    assert.ok(!noneResult.prompt.text.includes('CLIENT TOOL INVENTORY:'),
+        'tool_choice=none → no inventory injected');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// O9' — agentFrameToOpenAIDeltas: text delta / stop delta / tool delta
+// ============================================================================
+
+test('O9\' — agentFrameToOpenAIDeltas: text delta, stop delta on done, tool delta with done=true', () => {
+    const proxy = requireFreshProxy({});
+    const { agentFrameToOpenAIDeltas } = proxy;
+
+    function freshState() {
+        return { toolIndex: 0, sawTool: false, emitted: new Set(), tools: [], responseId: 'r-o9p' };
+    }
+
+    // --- Text frame → content delta ---
+    const textPayload = tcPayload(tcInteractionTextFrame('stream chunk'));
+    const { deltas: textDeltas, done: textDone } = agentFrameToOpenAIDeltas(textPayload, freshState());
+    assert.ok(textDeltas.length >= 1, 'text frame yields at least one delta');
+    const contentDelta = textDeltas.find(d => d.choices && d.choices[0].delta.content);
+    assert.ok(contentDelta, 'content delta present');
+    assert.equal(contentDelta.choices[0].delta.content, 'stream chunk', 'content correct');
+    assert.equal(textDone, false, 'text frame does not set done=true');
+
+    // --- Done frame → finish_reason:stop + done=true ---
+    const donePayload = tcPayload(tcDoneFrame());
+    const { deltas: doneDeltas, done: doneDone } = agentFrameToOpenAIDeltas(donePayload, freshState());
+    assert.ok(doneDeltas.length >= 1, 'done frame yields at least one delta');
+    const stopDelta = doneDeltas.find(d => d.choices && d.choices[0].finish_reason === 'stop');
+    assert.ok(stopDelta, 'done frame yields finish_reason:stop delta');
+    assert.equal(doneDone, true, 'done frame sets done=true');
+
+    // --- Shell tool-call frame → tool delta + finish_reason:tool_calls + done=true ---
+    const toolPayload = tcPayload(tcShellToolFrame('tc-1', 'ls -la'));
+    const { deltas: toolDeltas, done: toolDone } = agentFrameToOpenAIDeltas(toolPayload, freshState());
+    assert.equal(toolDone, true, 'tool_call frame sets done=true (STOP-AT-FIRST-TOOL)');
+    const toolCallsDelta = toolDeltas.find(d => d.choices && d.choices[0].delta.tool_calls);
+    assert.ok(toolCallsDelta, 'tool_calls delta present');
+    assert.equal(toolCallsDelta.choices[0].delta.tool_calls[0].index, 0, 'tool index is 0');
+    const finishDelta = toolDeltas.find(d => d.choices && d.choices[0].finish_reason === 'tool_calls');
+    assert.ok(finishDelta, 'finish_reason:tool_calls delta emitted');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// R12 — bash tool argument passes through UNMODIFIED (no nohup, no cwd strip)
+//        Regression: sanitizeNormalizedToolArguments is intentionally skipped.
+// ============================================================================
+
+test('R12 — bash tool arg "npm run dev" passes through UNMODIFIED via toOpenAiToolCalls', () => {
+    const proxy = requireFreshProxy({});
+    const { openaiToCursorPrompt, toOpenAiToolCalls } = proxy;
+
+    // Parse tools via openaiToCursorPrompt so shaped.tools is the right format
+    const shaped = openaiToCursorPrompt({
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'run dev server' }],
+        tools: [{
+            type: 'function',
+            function: {
+                name: 'bash',
+                parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+            },
+        }],
+    });
+
+    const toolCall = { name: 'bash', arguments: { command: 'npm run dev' } };
+    const result = toOpenAiToolCalls({ toolCalls: [toolCall], tools: shaped.tools, responseId: 'r12' });
+
+    assert.equal(result.length, 1, 'one tool call output');
+    const args = JSON.parse(result[0].function.arguments);
+
+    assert.equal(args.command, 'npm run dev',
+        'bash command passes through UNMODIFIED (no nohup rewriting)');
+    assert.ok(!JSON.stringify(args).includes('nohup'),
+        'nohup NOT injected (sanitizeNormalizedToolArguments correctly skipped)');
+
+    // Also verify a bash tool with cwd does NOT get cwd stripped
+    const withCwd = { name: 'bash', arguments: { command: 'npm test', cwd: '/project' } };
+    const result2 = toOpenAiToolCalls({ toolCalls: [withCwd], tools: shaped.tools, responseId: 'r12b' });
+    const args2 = JSON.parse(result2[0].function.arguments);
+    assert.equal(args2.command, 'npm test', 'command unchanged with cwd present');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// CD1' — Direct mode: routes to h2c AgentService mock; SDK headers present; hosted NOT called
+// ============================================================================
+
+test('CD1\' — CURSOR_DIRECT=1: routes to h2c AgentService; SDK headers present; hosted relay NOT called', async () => {
+    let exchangeCalled = false;
+    let agentCalled = false;
+    let agentHeaders = null;
+    let hostedCalled = false;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            exchangeCalled = true;
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cd1p' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream, headers) => {
+        agentCalled = true;
+        agentHeaders = Object.assign({}, headers);
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        stream.write(tcCombine(tcInteractionTextFrame('Direct hello!')));
+        stream.write(tcCombine(tcDoneFrame()));
+        stream.end();
+    });
+
+    const hostedRelay = await mockServer((req, res) => {
+        hostedCalled = true;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'hosted' }, finish_reason: 'stop' }] }));
+    });
+
+    const agentEndpoint = `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`;
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cd1p',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: agentEndpoint,
+        COMPOSER_API_URL: `http://127.0.0.1:${hostedRelay.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    assert.equal(proxy.CURSOR_DIRECT_ENABLED, true, 'CURSOR_DIRECT_ENABLED is true');
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10 },
+        headers: { authorization: 'Bearer test-key-cd1p', 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 200, 'response is 200');
+    assert.equal(exchangeCalled, true, 'token exchange was called');
+    assert.equal(agentCalled, true, 'AgentService h2c endpoint was called');
+    assert.equal(hostedCalled, false, 'hosted relay NOT called');
+
+    // Verify SDK headers on the AgentService request (no checksum — AgentService uses Bearer only)
+    assert.equal(agentHeaders['connect-protocol-version'], '1', 'connect-protocol-version:1 sent');
+    assert.ok(agentHeaders['content-type'] && agentHeaders['content-type'].includes('application/connect+proto'),
+        'content-type:application/connect+proto sent');
+    assert.equal(agentHeaders['x-cursor-client-type'], 'sdk', 'x-cursor-client-type:sdk sent');
+    assert.ok(agentHeaders['x-cursor-client-version'], 'x-cursor-client-version present');
+    assert.ok(agentHeaders['authorization'] && agentHeaders['authorization'].includes('AT-cd1p'),
+        'authorization Bearer token present');
+    assert.ok(!agentHeaders['x-cursor-checksum'], 'x-cursor-checksum NOT sent (AgentService uses Bearer only)');
+
+    // Verify response translated to Anthropic format
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    const textContent = body.content && body.content.find(b => b.type === 'text');
+    assert.ok(textContent && textContent.text === 'Direct hello!',
+        `content text is "Direct hello!"; got: ${JSON.stringify(body.content)}`);
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+    await hostedRelay.close();
+});
+
+// ============================================================================
+// CD3' — Streaming: ordered Anthropic SSE via h2c AgentService mock
+// ============================================================================
+
+test('CD3\' — streaming: ordered Anthropic SSE from h2c AgentService; deltas correct; no duplication', async () => {
+    const text1 = 'Hello';
+    const text2 = ' world';
+    const expectedFull = text1 + text2;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cd3p' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        stream.write(tcCombine(tcInteractionTextFrame(text1)));
+        stream.write(tcCombine(tcInteractionTextFrame(text2)));
+        stream.write(tcCombine(tcDoneFrame()));
+        stream.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cd3p',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const { statusCode, body } = await sseRequest(proxyPort, {
+        model: 'composer-2.5',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true, max_tokens: 50,
+    });
+
+    assert.equal(statusCode, 200, 'streaming response is 200');
+
+    const events = tcParseSSE(body);
+    const types = events.map(e => e.type);
+
+    assert.ok(types.includes('message_start'), 'message_start present');
+    assert.ok(types.includes('content_block_start'), 'content_block_start present');
+    assert.ok(types.includes('content_block_delta'), 'content_block_delta present');
+    assert.ok(types.includes('content_block_stop'), 'content_block_stop present');
+    assert.ok(types.includes('message_delta'), 'message_delta present');
+    assert.ok(types.includes('message_stop'), 'message_stop present');
+
+    const idx = t => types.indexOf(t);
+    assert.ok(idx('message_start') < idx('content_block_start'), 'message_start before content_block_start');
+    assert.ok(idx('content_block_start') < idx('content_block_delta'), 'content_block_start before delta');
+    assert.ok(idx('content_block_stop') < idx('message_delta'), 'content_block_stop before message_delta');
+
+    const textDeltas = events.filter(e => e.type === 'content_block_delta' &&
+        e.data && e.data.delta && e.data.delta.type === 'text_delta');
+    assert.ok(textDeltas.length >= 1, 'at least one text_delta');
+    const allText = textDeltas.map(e => e.data.delta.text).join('');
+    assert.equal(allText, expectedFull,
+        `concatenated text deltas must equal "${expectedFull}" (no duplication)`);
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD5' — Token: h2c 401 triggers exactly 2 exchanges + successful response
+// ============================================================================
+
+test('CD5\' — token refresh on h2c 401: exactly 2 exchanges + successful response', async () => {
+    let exchangeCount = 0;
+    let agentCallCount = 0;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            exchangeCount++;
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: `AT-cd5p-${exchangeCount}` }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        agentCallCount++;
+        if (agentCallCount === 1) {
+            // First call → 401 (stale token)
+            stream.respond({ ':status': 401, 'content-type': 'application/json' });
+            stream.end(JSON.stringify({ error: { message: 'token expired' } }));
+        } else {
+            // Second call → success
+            stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+            stream.write(tcCombine(tcInteractionTextFrame('After refresh')));
+            stream.write(tcCombine(tcDoneFrame()));
+            stream.end();
+        }
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cd5p',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 200, 'response is 200 after 401 refresh');
+    assert.equal(exchangeCount, 2, 'exactly 2 token exchanges (initial + refresh on 401)');
+    assert.equal(agentCallCount, 2, 'AgentService called twice (first 401, then 200)');
+
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'After refresh'),
+        'text content is "After refresh"');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+test('CD5-dedup — 3 concurrent cold-start getAccessToken calls → exactly 1 exchange (in-flight dedup)', async () => {
+    let exchangeCount = 0;
+
+    const tokenServer = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            exchangeCount++;
+            // Small delay so concurrent requests actually overlap
+            await new Promise(r => setTimeout(r, 10));
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-dedup' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-dedup',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenServer.port}`,
+        ENCRYPTION_KEY: 'composer-api',
+    });
+    const { getAccessToken, _accessTokenState } = proxy;
+    _accessTokenState.cache.clear();
+    _accessTokenState.inflight.clear();
+
+    // Fire 3 concurrent cold-start calls — all should resolve to the same token via 1 exchange
+    const results = await Promise.all([
+        getAccessToken('cursor-key-dedup'),
+        getAccessToken('cursor-key-dedup'),
+        getAccessToken('cursor-key-dedup'),
+    ]);
+
+    assert.equal(exchangeCount, 1, '3 concurrent cold-start calls → exactly 1 exchange (in-flight dedup)');
+    assert.ok(results.every(r => r === 'AT-dedup'), 'all 3 callers receive the same token');
+
+    await tokenServer.close();
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// CD6' — Unknown-service: (a) h2c 404 → 502 naming CURSOR_LOCAL_AGENT_ENDPOINT;
+//         (b) h2c 200 + Connect error trailer → 502 naming CURSOR_LOCAL_AGENT_ENDPOINT
+// ============================================================================
+
+test('CD6a\' — h2c 404 from AgentService → 502 naming CURSOR_LOCAL_AGENT_ENDPOINT', async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cd6ap' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 404, 'content-type': 'application/json' });
+        stream.end(JSON.stringify({ error: { message: 'not found' } }));
+    });
+
+    const agentEndpoint = `http://127.0.0.1:${h2cMock.port}/bad/agent/service`;
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cd6ap',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: agentEndpoint,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 502, 'h2c 404 from AgentService → 502');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'error', 'error envelope has type:error');
+    assert.ok(body.error && body.error.message, 'error has message');
+    assert.ok(body.error.message.includes(agentEndpoint),
+        `502 message must name CURSOR_LOCAL_AGENT_ENDPOINT ("${agentEndpoint}"); got: ${body.error.message}`);
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+test('CD6b\' — h2c 200 + Connect error trailer "unimplemented" → 502 naming CURSOR_LOCAL_AGENT_ENDPOINT', async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cd6bp' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        // Immediately send a Connect end-stream error trailer (flags=2)
+        const trailerPayload = new TextEncoder().encode(
+            JSON.stringify({ error: { message: 'unimplemented service or method' } })
+        );
+        const trailerFrame = tcConnectFrame(trailerPayload, 2);
+        stream.write(Buffer.from(trailerFrame));
+        stream.end();
+    });
+
+    const agentEndpoint = `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`;
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cd6bp',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: agentEndpoint,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 502, 'h2c 200 + Connect error trailer → 502');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'error', 'error envelope has type:error');
+    assert.ok(body.error && body.error.message, 'error has message');
+    assert.ok(body.error.message.includes(agentEndpoint),
+        `502 message must name CURSOR_LOCAL_AGENT_ENDPOINT; got: ${body.error.message}`);
+    assert.ok(
+        body.error.message.toLowerCase().includes('unimplemented') ||
+        body.error.message.toLowerCase().includes('agentservice'),
+        `502 message must mention unimplemented or AgentService; got: ${body.error.message}`
+    );
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-tool — e2e proto tool call via h2c: run-frame has tool inventory; shell tool → tool_use
+// ============================================================================
+
+test('CD-tool — h2c shell tool call: run-frame prompt has tool inventory; response is Anthropic tool_use', async () => {
+    let capturedRunFrame = null;
+    let streamRstCode = null;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdtool' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    // Capture the run frame first, then send TWO distinct tool frames with NO done in between.
+    // The proxy must stop after the FIRST emittable tool (stop-at-first-emittable-tool) and
+    // RST_STREAM with NGHTTP2_CANCEL — the second frame must never appear in the response.
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.once('close', () => { streamRstCode = stream.rstCode !== undefined ? stream.rstCode : -1; });
+        stream.once('data', (chunk) => {
+            capturedRunFrame = Buffer.from(chunk);
+            stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+            stream.write(tcCombine(tcShellToolFrame('tool-call-1', 'echo hello')));
+            stream.write(tcCombine(tcShellToolFrame('tool-call-2', 'echo world'))); // second tool — must be suppressed
+            // No done frame, no stream.end() — proxy must RST with NGHTTP2_CANCEL after first tool
+        });
+        stream.on('error', () => {}); // suppress write errors after RST
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdtool',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: {
+            model: 'composer-2.5',
+            messages: [{ role: 'user', content: 'run a command' }],
+            tools: [{
+                name: 'bash', description: 'Run a shell command',
+                input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+            }],
+            max_tokens: 100,
+        },
+        headers: { 'connection': 'close' },
+    });
+
+    // Run-frame prompt must contain tool inventory (tcExtractPromptText walks AgentService nesting)
+    assert.ok(capturedRunFrame, 'h2c mock received run-frame data');
+    const promptText = tcExtractPromptText(capturedRunFrame);
+    assert.ok(promptText.length > 0, 'prompt text decoded from run-frame');
+    assert.ok(promptText.includes('CLIENT TOOL INVENTORY:'),
+        'run-frame prompt contains CLIENT TOOL INVENTORY:');
+    assert.ok(promptText.includes('bash'), 'run-frame prompt contains tool name "bash"');
+
+    // Wait for h2c stream close event (proxy RSTs after emitting first tool)
+    const rstDeadline = Date.now() + 1500;
+    while (streamRstCode === null && Date.now() < rstDeadline) {
+        await new Promise(r => setTimeout(r, 20));
+    }
+
+    // Response must be Anthropic tool_use
+    assert.equal(result.statusCode, 200, 'response is 200');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.stop_reason === 'tool_use', `stop_reason is tool_use; got: ${body.stop_reason}`);
+
+    // EXACTLY ONE tool_use block — stop-at-first-emittable-tool dedup must suppress the second frame
+    const toolUseBlocks = body.content.filter(b => b.type === 'tool_use');
+    assert.equal(toolUseBlocks.length, 1,
+        `exactly 1 tool_use block (second tool must be suppressed); got: ${toolUseBlocks.length}`);
+    const toolUse = toolUseBlocks[0];
+    assert.ok(typeof (toolUse.input && toolUse.input.command) === 'string',
+        `tool_use input has command string; got: ${JSON.stringify(toolUse && toolUse.input)}`);
+
+    // h2c stream must be RST'd with NGHTTP2_CANCEL after the first tool (C1 teardown)
+    assert.ok(streamRstCode !== null, 'h2c server stream received close event after first tool');
+    assert.equal(streamRstCode, http2.constants.NGHTTP2_CANCEL,
+        `h2c stream reset code must be NGHTTP2_CANCEL (8); got: ${streamRstCode}`);
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-fallback — CURSOR_DIRECT=0: composer-2.5 uses hosted forwardToComposer
+// (direct is the DEFAULT now; CURSOR_DIRECT=0 opts back into the hosted relay)
+// ============================================================================
+
+test('CD-fallback — CURSOR_DIRECT=0: composer-2.5 routes to hosted relay, NOT direct Cursor', async () => {
+    let hostedCalled = false;
+    let hostedPath = null;
+
+    const hostedRelay = await mockServer(async (req, res) => {
+        hostedCalled = true;
+        hostedPath = req.url;
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-fallback',
+            choices: [{ message: { role: 'assistant', content: 'Hosted reply' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 3 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-fallback',
+        CURSOR_DIRECT: '0', // opt OUT of default direct mode → hosted relay
+        COMPOSER_API_URL: `http://127.0.0.1:${hostedRelay.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    assert.equal(proxy.CURSOR_DIRECT_ENABLED, false, 'CURSOR_DIRECT_ENABLED is false when CURSOR_DIRECT=0');
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 },
+    });
+
+    assert.equal(result.statusCode, 200, 'response is 200');
+    assert.equal(hostedCalled, true, 'hosted relay was called (fallback path)');
+    assert.equal(hostedPath, '/opencodev2/v1/chat/completions', 'fixed composer route used');
+
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'Hosted reply'),
+        'text content is "Hosted reply" from hosted relay');
+
+    await closeProxy(proxy);
+    await hostedRelay.close();
+});
+
+// ============================================================================
+// CD-abort' — real mid-stream client disconnect → h2c stream reset with NGHTTP2_CANCEL
+// Proves onClientClose → controller.abort → req.close(NGHTTP2_CANCEL) on the h2c stream.
+// ============================================================================
+
+test('CD-abort\' — real client disconnect mid-stream: h2c stream reset with NGHTTP2_CANCEL', async () => {
+    let streamResetCode = null;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdabortp' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        // Send first frame to trigger SSE to client, then stall (no done/end).
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        stream.write(tcCombine(tcInteractionTextFrame('stream start')));
+        // Record the RST_STREAM code when the proxy cancels the stream.
+        stream.once('close', () => {
+            streamResetCode = stream.rstCode !== undefined ? stream.rstCode : -1;
+        });
+        stream.on('error', () => {}); // suppress write errors after reset
+        // Safety timeout to avoid hanging the mock (3 s)
+        setTimeout(() => { try { stream.close(); } catch { /* ignore */ } }, 3000);
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdabortp',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    // Open a streaming request; destroy the socket once the first SSE data arrives.
+    await new Promise((resolve) => {
+        const bodyBuf = Buffer.from(JSON.stringify({
+            model: 'composer-2.5',
+            messages: [{ role: 'user', content: 'hi' }],
+            stream: true, max_tokens: 50,
+        }));
+        const req = http.request({
+            hostname: '127.0.0.1', port: proxyPort,
+            path: '/v1/messages', method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'authorization': 'Bearer test-key-cdabortp',
+                'content-length': String(bodyBuf.length),
+            },
+        }, (res) => {
+            let destroyed = false;
+            res.on('data', () => {
+                if (!destroyed) { destroyed = true; res.socket.destroy(); }
+            });
+            res.on('close', resolve);
+            res.on('error', () => resolve());
+        });
+        req.on('error', () => resolve());
+        req.end(bodyBuf);
+        setTimeout(resolve, 2000); // safety
+    });
+
+    // Wait for the h2c stream close event to propagate (up to 1.5 s)
+    const deadline = Date.now() + 1500;
+    while (streamResetCode === null && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 20));
+    }
+
+    // NGHTTP2_CANCEL = 8 — the proxy calls req.close(http2.constants.NGHTTP2_CANCEL) on abort
+    assert.ok(streamResetCode !== null,
+        'h2c server stream received close event after client disconnect');
+    assert.equal(streamResetCode, http2.constants.NGHTTP2_CANCEL,
+        `h2c stream reset code must be NGHTTP2_CANCEL (8); got: ${streamResetCode}`);
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// token-exchange-failure' — 500 on first exchange does NOT cache a rejected Promise;
+// second request makes a fresh exchange and succeeds (via h2c AgentService mock).
+// ============================================================================
+
+test('token-exchange-failure\' — 500 on first exchange no cached rejected Promise; second request succeeds', async () => {
+    let exchangeCount = 0;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            exchangeCount++;
+            await bufferBody(req);
+            if (exchangeCount === 1) {
+                res.writeHead(500, { 'content-type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'internal server error' }));
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-exfail-ok' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    // h2c mock only serves the second (successful) request
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        stream.write(tcCombine(tcInteractionTextFrame('success after retry')));
+        stream.write(tcCombine(tcDoneFrame()));
+        stream.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-exfailp',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    // First request: exchange returns 500 → must surface error (not hang)
+    const result1 = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'first' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+    assert.ok(result1.statusCode >= 400,
+        `first request must surface an error (4xx/5xx); got ${result1.statusCode}`);
+    assert.equal(exchangeCount, 1, 'exactly 1 exchange attempt on first (failing) request');
+
+    // inflight map must be empty — getAccessToken finally block must have run
+    const { _accessTokenState } = proxy;
+    assert.equal(_accessTokenState.inflight.size, 0,
+        'inflight map is empty after exchange failure (finally block deleted the entry)');
+    assert.equal(_accessTokenState.cache.size, 0,
+        'token cache is empty after exchange failure (no bad token cached)');
+
+    // Second request: exchange returns 200 → must succeed
+    const result2 = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'second' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+    assert.equal(result2.statusCode, 200,
+        'second request succeeds after exchange failure (no stuck rejected Promise)');
+    assert.equal(exchangeCount, 2, 'exactly 2 exchange calls total');
+    const body = JSON.parse(result2.body);
+    assert.equal(body.type, 'message', 'second response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'success after retry'),
+        'second response text is "success after retry"');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-no-ctx — C1 guard: text+done without request_context must complete in < 2s
+// Proves the done frame triggers endRequestOnce (half-close) without waiting
+// for a request_context write-back that never arrives.
+// ============================================================================
+
+test('CD-no-ctx — no request_context frame → done triggers half-close (C1 guard < 2s)', { timeout: 3000 }, async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdnoctx' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        stream.write(tcCombine(tcInteractionTextFrame('no-ctx text')));
+        stream.write(tcCombine(tcDoneFrame()));
+        stream.end();
+        // No request_context frame — done frame alone must trigger C1 half-close.
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdnoctx',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const start = Date.now();
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+    const elapsed = Date.now() - start;
+
+    assert.equal(result.statusCode, 200, 'response is 200');
+    assert.ok(elapsed < 2000,
+        `C1 guard: response completed in < 2s (no ctx frame present); took ${elapsed}ms`);
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'no-ctx text'),
+        'text content is "no-ctx text"');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-ctx — request_context write-back: proxy writes RequestContextResult back
+// on the h2c stream (bidi), then half-closes (C1).
+// ============================================================================
+
+test('CD-ctx — request_context frame → proxy writes RequestContextResult back on h2c stream (bidi)', async () => {
+    const clientWrites = []; // collects Buffer chunks written by proxy → server (run-frame + ctx result)
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdctx' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        // Collect every DATA chunk the proxy writes up the stream
+        stream.on('data', (chunk) => clientWrites.push(Buffer.from(chunk)));
+
+        // On first DATA (run frame), start the response with a request_context frame
+        stream.once('data', () => {
+            stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+            stream.write(tcCombine(tcRequestContextFrame(42, 'exec-ctx-1')));
+            // After proxy has had time to write back RequestContextResult, send text + done
+            setTimeout(() => {
+                stream.write(tcCombine(tcInteractionTextFrame('ctx response')));
+                stream.write(tcCombine(tcDoneFrame()));
+                stream.end();
+            }, 100);
+        });
+        stream.on('error', () => {}); // suppress write errors after half-close
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdctx',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'ctx test' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    // Proxy must have written ≥2 chunks: run-frame + RequestContextResult (C1 write-back)
+    assert.ok(clientWrites.length >= 2,
+        `proxy wrote ≥2 frames up h2c stream (run-frame + RequestContextResult); got ${clientWrites.length}`);
+    // Second write must be a valid 5-byte+ Connect frame
+    assert.ok(clientWrites[1] && clientWrites[1].length >= 5,
+        `RequestContextResult frame is ≥5 bytes; got ${clientWrites[1] && clientWrites[1].length}`);
+
+    // Decode the RequestContextResult payload (strip 5-byte Connect header) and assert structure.
+    // encodeAgentClientRequestContextResult wraps: field2(execClientMessage) → field10(result)
+    //   → field1(success) → field1(requestContext) → field32(capability boolean = 1).
+    {
+        const ctxBuf = clientWrites[1];
+        const ctxPayload = new Uint8Array(ctxBuf.buffer, ctxBuf.byteOffset + 5, ctxBuf.byteLength - 5);
+        // outer: field 2 = execClientMessage (wt=2)
+        const outerF2 = tcDecodeFields(ctxPayload).find(f => f.no === 2 && f.wt === 2);
+        assert.ok(outerF2, 'RequestContextResult outer field 2 (execClientMessage) present');
+        // execClientMessage: field 10 = result (wt=2)
+        const execF10 = tcDecodeFields(outerF2.value).find(f => f.no === 10 && f.wt === 2);
+        assert.ok(execF10, 'execClientMessage field 10 (result) present');
+        // result: field 1 = success (wt=2)
+        const resF1 = tcDecodeFields(execF10.value).find(f => f.no === 1 && f.wt === 2);
+        assert.ok(resF1, 'result field 1 (success) present');
+        // success: field 1 = requestContext (wt=2)
+        const sucF1 = tcDecodeFields(resF1.value).find(f => f.no === 1 && f.wt === 2);
+        assert.ok(sucF1, 'success field 1 (requestContext) present');
+        // requestContext: field 32 = capability boolean (varint = 1n)
+        const rcF32 = tcDecodeFields(sucF1.value).find(f => f.no === 32 && f.wt === 0);
+        assert.ok(rcF32 && rcF32.value === 1n,
+            `requestContext field 32 (capability boolean) = 1; got: ${rcF32 && rcF32.value}`);
+    }
+
+    assert.equal(result.statusCode, 200, 'response is 200 after request_context write-back');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'ctx response'),
+        'text content is "ctx response"');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-empty — empty Connect frame (flags=0, length=0) → no crash; valid 200
+// ============================================================================
+
+test('CD-empty — empty Connect frame (zero-length payload) does not crash proxy; response is 200', async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdempty' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        // Empty frame: flags=0, payload=new Uint8Array(0) → 5-byte frame with zero-length payload
+        stream.write(tcCombine(tcConnectFrame(new Uint8Array(0))));
+        stream.write(tcCombine(tcInteractionTextFrame('after empty')));
+        stream.write(tcCombine(tcDoneFrame()));
+        stream.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdempty',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'empty frame test' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 200, 'empty frame does not crash proxy; response is 200');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'after empty'),
+        'text after empty frame is "after empty"');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-compressed — Connect frame with flags&1=1 → proxy returns 502
+// (ConnectFramePushParser throws; forwardToCursorDirect catches → 502)
+// ============================================================================
+
+test('CD-compressed — Connect frame with compression flag (flags&1=1) → 502', async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdcomp' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        // flags=1 → compressed frame (proxy cannot decode; ConnectFramePushParser throws)
+        stream.write(tcCombine(tcConnectFrame(new Uint8Array([0, 0, 0, 0]), 1)));
+        stream.end();
+        stream.on('error', () => {}); // suppress write-after-reset errors
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdcomp',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'compressed' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 502, 'compressed frame → 502');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'error', 'error envelope has type:error');
+    assert.ok(body.error && body.error.message, 'error has message');
+    assert.ok(body.error.message.toLowerCase().includes('compress'),
+        `502 message mentions "compress"; got: ${body.error.message}`);
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-429 — h2c :status 429 → proxy passthrough 429 with rate_limit_error
+// ============================================================================
+
+test('CD-429 — h2c status 429 from AgentService → proxy passthrough 429 rate_limit_error', async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cd429' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.respond({ ':status': 429, 'content-type': 'application/json', 'retry-after': '30' });
+        stream.end(JSON.stringify({ error: { message: 'rate limit exceeded' } }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cd429',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'rate limited' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 429, 'h2c 429 passes through as proxy 429');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'error', 'error envelope has type:error');
+    assert.equal(body.error.type, 'rate_limit_error', 'error type is rate_limit_error');
+    assert.ok(body.error.message, 'error has message');
+    assert.equal(result.headers['retry-after'], '30', 'retry-after header forwarded');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// CD-no-usage — no usage data from Cursor → response is still valid 200
+// ============================================================================
+
+test('CD-no-usage — no usage data from AgentService → response is valid 200 Anthropic message', async () => {
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdnousage' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    const h2cMock = await mockH2cServer((stream) => {
+        // Plain text + done, no x-tokens-used or any usage data
+        stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+        stream.write(tcCombine(tcInteractionTextFrame('no usage text')));
+        stream.write(tcCombine(tcDoneFrame()));
+        stream.end();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdnousage',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'no usage' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+
+    assert.equal(result.statusCode, 200, 'response is 200 even with no usage data');
+    const body = JSON.parse(result.body);
+    assert.equal(body.type, 'message', 'response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'no usage text'),
+        'text content is "no usage text"');
+    assert.ok(body.usage && typeof body.usage === 'object',
+        'usage field is present (even if zeroed)');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
+});
+
+// ============================================================================
+// Unit:GOAWAY — h2c session pool evicts entry when server sends GOAWAY frame
+// ============================================================================
+
+test('Unit:GOAWAY — pool session evicted when h2c server sends GOAWAY', async () => {
+    let serverSession = null;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-goaway' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    // Raw h2c server — capture the server-side session so we can send GOAWAY manually
+    const goawayServer = await new Promise((resolve) => {
+        const server = http2.createServer();
+        server.on('session', (sess) => { serverSession = sess; });
+        server.on('stream', (stream) => {
+            stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+            stream.write(tcCombine(tcInteractionTextFrame('pre-goaway')));
+            stream.write(tcCombine(tcDoneFrame()));
+            stream.end();
+        });
+        server.listen(0, '127.0.0.1', () => {
+            const { port } = server.address();
+            resolve({ server, port, close: () => new Promise((res) => server.close(res)) });
+        });
+        server.unref();
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-goaway',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${goawayServer.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    // First request populates the pool
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'pre-goaway' }], max_tokens: 10 },
+        headers: { 'connection': 'close' },
+    });
+    assert.equal(result.statusCode, 200, 'request succeeds before GOAWAY');
+    assert.equal(proxy._http2PoolSize(), 1, 'pool has 1 session after first request');
+
+    // Send GOAWAY from server → proxy client fires 'goaway' → closePooledHttp2Client evicts entry
+    assert.ok(serverSession, 'server session captured');
+    serverSession.goaway();
+
+    // Allow GOAWAY propagation over loopback (100ms is generous)
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(proxy._http2PoolSize(), 0,
+        'pool is empty after server GOAWAY (closePooledHttp2Client evicted the entry)');
+
+    // Force-destroy the server session so the underlying TCP socket closes immediately.
+    // Both the http2 client (proxy) and server are unref()'d — without this, the graceful
+    // TCP close-handshake is never completed and goawayServer.close() would hang (event
+    // loop empties while the server is still waiting for the connection to drain).
+    try { if (serverSession && !serverSession.destroyed) serverSession.destroy(); } catch { /* ignore */ }
+    await new Promise((resolve) => setTimeout(resolve, 30)); // let TCP teardown propagate
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await goawayServer.close();
+});
+
+// ============================================================================
+// Unit:proto-wrappers — protoStringField / protoVarintField / protoMessageField
+// Verifies the undefined-safe proto wrappers exported from proxy.js encode correctly.
+// ============================================================================
+
+test('Unit:proto-wrappers — protoStringField / protoVarintField / protoMessageField encode correctly', () => {
+    const proxy = requireFreshProxy({});
+    const { protoStringField, protoVarintField, protoMessageField } = proxy;
+
+    // --- protoVarintField ---
+    // field 1, varint 300 → tag=0x08 + varint 300 (two-byte: 0xAC 0x02)
+    const v300 = protoVarintField(1, 300);
+    assert.ok(v300 instanceof Uint8Array, 'protoVarintField returns Uint8Array');
+    assert.equal(v300.length, 3, 'protoVarintField(1,300) → 3 bytes (1 tag + 2 varint)');
+    assert.equal(v300[0], 0x08, 'varint field 1 tag = 0x08 ((1<<3)|0)');
+    assert.equal(v300[1], 0xAC, 'varint 300 low byte = 0xAC (44|0x80)');
+    assert.equal(v300[2], 0x02, 'varint 300 high byte = 0x02');
+
+    // bool mappings: true→1, false→0
+    const vTrue = protoVarintField(1, true);
+    assert.equal(vTrue.length, 2, 'protoVarintField(1,true) → 2 bytes');
+    assert.equal(vTrue[1], 1, 'true maps to varint 1');
+    const vFalse = protoVarintField(1, false);
+    assert.equal(vFalse[1], 0, 'false maps to varint 0');
+
+    // undefined → zero-length (field completely omitted)
+    const vUndef = protoVarintField(1, undefined);
+    assert.ok(vUndef instanceof Uint8Array, 'protoVarintField(undefined) returns Uint8Array');
+    assert.equal(vUndef.length, 0, 'undefined varint → zero-length (field omitted)');
+
+    // --- protoStringField ---
+    // field 2, "hello" → tag=0x12 + length 5 + UTF-8 bytes
+    const sHello = protoStringField(2, 'hello');
+    assert.ok(sHello instanceof Uint8Array, 'protoStringField returns Uint8Array');
+    assert.equal(sHello[0], 0x12, 'string field 2 tag = 0x12 ((2<<3)|2)');
+    assert.equal(sHello[1], 5, 'length byte = 5');
+    assert.equal(new TextDecoder().decode(sHello.slice(2)), 'hello', 'string bytes correct');
+
+    // empty string → tag + length 0 (2 bytes total)
+    const sEmpty = protoStringField(3, '');
+    assert.equal(sEmpty[0], 0x1A, 'empty string field 3 tag = 0x1A ((3<<3)|2)');
+    assert.equal(sEmpty[1], 0, 'empty string length byte = 0');
+    assert.equal(sEmpty.length, 2, 'empty string → 2 bytes (tag + length)');
+
+    // undefined → zero-length (field completely omitted)
+    const sUndef = protoStringField(1, undefined);
+    assert.ok(sUndef instanceof Uint8Array, 'protoStringField(undefined) returns Uint8Array');
+    assert.equal(sUndef.length, 0, 'undefined string → zero-length (field omitted)');
+
+    // --- protoMessageField ---
+    // field 1, nested = protoVarintField(1,1) = [0x08,0x01] → tag=0x0A + length 2 + nested
+    const nested = protoVarintField(1, 1); // [0x08, 0x01]
+    const msg = protoMessageField(1, nested);
+    assert.ok(msg instanceof Uint8Array, 'protoMessageField returns Uint8Array');
+    assert.equal(msg[0], 0x0A, 'message field 1 tag = 0x0A ((1<<3)|2)');
+    assert.equal(msg[1], nested.length, `length byte = ${nested.length}`);
+    assert.deepEqual(Array.from(msg.slice(2)), Array.from(nested), 'nested bytes correct');
+
+    closeProxy(proxy);
+});
+
+// ============================================================================
+// CD-concurrent-fault — two simultaneous requests share one h2c session;
+// one stream is RST'd (NGHTTP2_INTERNAL_ERROR), the other completes normally.
+// Proves per-stream faults don't kill sibling streams on the shared session.
+// ============================================================================
+
+test('CD-concurrent-fault — one stream RST\'d on shared h2c session; sibling returns 200', { timeout: 8000 }, async () => {
+    let firstStreamSeen = false;
+
+    const tokenMock = await mockServer(async (req, res) => {
+        if (req.url.endsWith('/auth/exchange_user_api_key')) {
+            await bufferBody(req);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ accessToken: 'AT-cdfault' }));
+        }
+        res.writeHead(404); res.end();
+    });
+
+    // Both requests hit the same origin → same pooled h2c session → two streams.
+    // The first stream to send data is RST'd with INTERNAL_ERROR (no response headers
+    // sent first so the proxy's status stays at 502 and the stream close fires fail()).
+    // The second stream returns a normal text response.
+    const h2cMock = await mockH2cServer((stream) => {
+        stream.once('data', () => {
+            if (!firstStreamSeen) {
+                firstStreamSeen = true;
+                // RST WITHOUT sending response headers first — proxy never receives ':status',
+                // initial status=502 stays, stream error/close triggers fail() → 5xx to client.
+                setTimeout(() => {
+                    try { stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR); } catch { /* ignore */ }
+                }, 40);
+            } else {
+                // Second stream: complete normally after a brief delay
+                stream.respond({ ':status': 200, 'content-type': 'application/connect+proto' });
+                setTimeout(() => {
+                    stream.write(tcCombine(tcInteractionTextFrame('survivor text')));
+                    stream.write(tcCombine(tcDoneFrame()));
+                    stream.end();
+                }, 80);
+            }
+        });
+        stream.on('error', () => {}); // suppress write-after-RST errors
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-key-cdfault',
+        CURSOR_DIRECT: '1',
+        CURSOR_BACKEND_BASE_URL: `http://127.0.0.1:${tokenMock.port}`,
+        CURSOR_LOCAL_AGENT_ENDPOINT: `http://127.0.0.1:${h2cMock.port}/agent.v1.AgentService/Run`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+    proxy._accessTokenState.cache.clear();
+    proxy._accessTokenState.inflight.clear();
+
+    const proxyPort = await listenProxy(proxy);
+
+    // Fire two concurrent requests — same h2c origin → shared session, separate streams
+    const [result1, result2] = await Promise.all([
+        proxyRequest(proxyPort, {
+            body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'fault req' }], max_tokens: 10 },
+            headers: { 'connection': 'close' },
+        }),
+        proxyRequest(proxyPort, {
+            body: { model: 'composer-2.5', messages: [{ role: 'user', content: 'survivor req' }], max_tokens: 10 },
+            headers: { 'connection': 'close' },
+        }),
+    ]);
+
+    const results = [result1, result2];
+    const okResult = results.find(r => r.statusCode === 200);
+    const errResult = results.find(r => r.statusCode >= 400);
+
+    // The RST'd stream must surface an error (not hang or succeed)
+    assert.ok(errResult,
+        `RST'd stream must surface a 4xx/5xx; got: ${results.map(r => r.statusCode).join(', ')}`);
+    // The survivor stream must succeed
+    assert.ok(okResult,
+        `survivor stream must return 200; got: ${results.map(r => r.statusCode).join(', ')}`);
+
+    const body = JSON.parse(okResult.body);
+    assert.equal(body.type, 'message', 'survivor response is Anthropic message');
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'survivor text'),
+        'survivor response contains "survivor text"');
+
+    proxy._closeHttp2Pool();
+    await closeProxy(proxy);
+    await tokenMock.close();
+    await h2cMock.close();
 });
