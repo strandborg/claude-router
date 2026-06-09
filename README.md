@@ -226,10 +226,11 @@ Only the `id` is wrapped; `display_name` keeps the real model name, so the picke
 
 #### 1M-context variants (`[1m]`)
 
-Claude Code reads a model's context window from a literal `[1m]` suffix in the id (`/\[1m\]/i` → 1,000,000 tokens) and, when it sees one, also adds the `context-1m-2025-08-07` beta header to the request. The router can offer a 1M variant of a foreign model by listing a second `[1m]`-suffixed entry — set `MODELS_1M` to the comma-separated **real** ids (post-demap) that should get one:
+Claude Code reads a model's context window from a literal `[1m]` suffix in the id (`/\[1m\]/i` → 1,000,000 tokens) and, when it sees one, also adds the `context-1m-2025-08-07` beta header to the request. The router can offer a 1M variant of a foreign model by listing a second `[1m]`-suffixed entry — set `MODELS_1M` to a comma-separated list of **real** ids (post-demap). Each token is either an exact id or a `prefix*` glob, so "all gemini models" is just `gemini*`:
 
 ```
-MODELS_1M=gemini-3.1-pro-preview,composer-2.5
+MODELS_1M=gemini*            # every gemini-* model gets a 1M variant
+MODELS_1M=gemini*,gpt-5      # plus an exact id
 ```
 
 For each listed model the merged list gains an extra entry — e.g. `claude-router-gemini-3.1-pro-preview[1m]`, shown as `gemini-3.1-pro-preview (1M context)` — alongside the default 200K base entry. When such a variant is selected:
@@ -239,7 +240,15 @@ For each listed model the merged list gains an extra entry — e.g. `claude-rout
 
 `MODELS_1M` is opt-in and defaults to empty — only add models whose backend genuinely serves a large window, since the suffix makes Claude Code treat the model as 1M-token locally (affecting compaction/usage math). This applies **only** to the router's `claude-router-*` namespace: a native `claude-opus-4-8[1m]` request has no prefix, so its id and its 1M beta header pass through to Anthropic completely untouched.
 
-**Client-side caveat.** Whether the *dialog* renders these entries still depends on the Claude Code build: model discovery is also gated client-side, and surfacing the list may additionally require the relevant flag (e.g. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) or an `availableModels` allowlist entry, depending on version. The remapping removes the `^(claude|anthropic)` id-filter obstacle; the router serving a correct, filter-passing merged `/v1/models` is the provider-agnostic, forward-compatible piece.
+#### Making the models appear in `/model`
+
+Serving a correct merged `/v1/models` is only half of it — Claude Code does **not** query that endpoint for the picker unless its **gateway model discovery** is enabled. To turn it on, set this in **Claude Code's own environment** (not the proxy):
+
+```
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+Put it wherever Claude Code reads env from — e.g. the `env` block of `~/.claude/settings.json`, or the same shell profile that exports `ANTHROPIC_BASE_URL`. With it set (and a first-party login pointed at a custom `ANTHROPIC_BASE_URL`, i.e. this router), Claude Code calls `GET /v1/models` on the base URL during bootstrap and lists the results — keeping only ids matching `^(claude|anthropic)`, which is exactly why the remapping above exists. **Restart Claude Code after setting it**; discovery runs at startup, so the models show on the next launch (a fresh session may need one bootstrap cycle).
 
 ## Routing reference
 

@@ -430,16 +430,31 @@ function demapModelId(name) {
     return real;
 }
 
-// addOneMVariants(entries, oneMSet) — for each entry whose (real) id is in oneMSet,
-// append an extra entry carrying the `[1m]` suffix so Claude Code offers a 1M-context
-// variant in the dialog. Operates on real-id entries (before remapping). The variant's
-// display_name gets a "(1M context)" tag. Never mutates inputs.
-function addOneMVariants(entries, oneMSet) {
+// modelMatchesAny(id, patterns) — case-insensitive match of a model id against a list
+// of MODELS_1M patterns. A pattern ending in `*` is a prefix match (e.g. `gemini*`
+// matches every gemini-* id); otherwise it is an exact match. Lets "all gemini models"
+// be expressed as a single `gemini*` token without enumerating each id.
+function modelMatchesAny(id, patterns) {
+    if (typeof id !== 'string' || !Array.isArray(patterns)) return false;
+    const a = id.toLowerCase();
+    for (const raw of patterns) {
+        if (typeof raw !== 'string' || !raw) continue;
+        const p = raw.toLowerCase();
+        if (p.endsWith('*') ? a.startsWith(p.slice(0, -1)) : a === p) return true;
+    }
+    return false;
+}
+
+// addOneMVariants(entries, oneMPatterns) — for each entry whose (real) id matches a
+// MODELS_1M pattern, append an extra entry carrying the `[1m]` suffix so Claude Code
+// offers a 1M-context variant in the dialog. Operates on real-id entries (before
+// remapping). The variant's display_name gets a "(1M context)" tag. Never mutates inputs.
+function addOneMVariants(entries, oneMPatterns) {
     if (!Array.isArray(entries)) return [];
     const out = [];
     for (const e of entries) {
         out.push(e);
-        if (e && typeof e.id === 'string' && oneMSet && oneMSet.has(e.id)) {
+        if (e && typeof e.id === 'string' && modelMatchesAny(e.id, oneMPatterns)) {
             out.push({
                 ...e,
                 id: e.id + ONE_M_SUFFIX,
@@ -1255,8 +1270,9 @@ async function handleModelsList(clientReq, clientRes) {
     }
     const anthropicData = anthJson && Array.isArray(anthJson.data) ? anthJson.data : [];
 
-    // Real ids (post-demap) that also get a [1m] 1M-context variant offered.
-    const oneMSet = new Set(config.models1m.split(',').map((s) => s.trim()).filter(Boolean));
+    // MODELS_1M patterns (exact id or `prefix*`) whose matching models also get a
+    // [1m] 1M-context variant offered.
+    const oneMPatterns = config.models1m.split(',').map((s) => s.trim()).filter(Boolean);
 
     // --- 2. LiteLLM upstream (when enabled) -----------------------------------
     let litellmData = [];
@@ -1283,7 +1299,7 @@ async function handleModelsList(clientReq, clientRes) {
                 // Translate → add opt-in [1m] variants (on real ids) → remap ids into the
                 // claude-router-* namespace so the dialog filter accepts them. The real id
                 // (and any [1m] suffix) is recovered on the inbound request.
-                const real = addOneMVariants(items.map(openAIModelToAnthropic).filter(Boolean), oneMSet);
+                const real = addOneMVariants(items.map(openAIModelToAnthropic).filter(Boolean), oneMPatterns);
                 litellmData = remapEntries(real);
             } else {
                 console.warn(`[proxy] models-list: LiteLLM /v1/models returned ${ll.status} — skipping LiteLLM models`);
@@ -1296,7 +1312,7 @@ async function handleModelsList(clientReq, clientRes) {
 
     // --- 3. Composer (synthetic, when enabled) --------------------------------
     const composerData = COMPOSER_ENABLED
-        ? remapEntries(addOneMVariants(composerModelEntries(config), oneMSet))
+        ? remapEntries(addOneMVariants(composerModelEntries(config), oneMPatterns))
         : [];
 
     // --- 4. Merge + respond ----------------------------------------------------
@@ -1695,6 +1711,7 @@ if (require.main === module) {
         demapModelId,
         remapEntries,
         addOneMVariants,
+        modelMatchesAny,
         withoutBeta,
         // Composer config visibility (tests only)
         COMPOSER_ENABLED,

@@ -2347,27 +2347,49 @@ test('Unit — remap/demap round-trips and leaves claude/anthropic ids alone', (
     closeProxy(proxy);
 });
 
-test('Unit — addOneMVariants appends [1m] entries only for listed ids', () => {
+test('Unit — modelMatchesAny: exact and prefix-glob patterns', () => {
+    const proxy = requireFreshProxy({});
+    const { modelMatchesAny } = proxy;
+
+    assert.equal(modelMatchesAny('gpt-5', ['gpt-5']), true, 'exact match');
+    assert.equal(modelMatchesAny('gpt-5', ['gpt-4']), false, 'exact mismatch');
+    // `gemini*` covers every gemini id (the "all gemini models" case).
+    assert.equal(modelMatchesAny('gemini-3.1-pro-preview', ['gemini*']), true);
+    assert.equal(modelMatchesAny('gemini-3-flash-preview', ['gemini*']), true);
+    assert.equal(modelMatchesAny('GEMINI-3.1-PRO', ['gemini*']), true, 'case-insensitive');
+    assert.equal(modelMatchesAny('gpt-5', ['gemini*']), false, 'prefix does not over-match');
+    assert.equal(modelMatchesAny('composer-2.5', ['gemini*']), false, 'composer excluded by gemini* (not 1M)');
+    assert.equal(modelMatchesAny('x', []), false, 'empty patterns never match');
+
+    closeProxy(proxy);
+});
+
+test('Unit — addOneMVariants appends [1m] entries for matching patterns', () => {
     const proxy = requireFreshProxy({});
     const { addOneMVariants } = proxy;
 
     const entries = [
         { type: 'model', id: 'gemini-3.1-pro-preview', display_name: 'gemini-3.1-pro-preview' },
+        { type: 'model', id: 'gemini-3-flash-preview', display_name: 'gemini-3-flash-preview' },
         { type: 'model', id: 'gpt-5', display_name: 'gpt-5' },
     ];
-    const out = addOneMVariants(entries, new Set(['gemini-3.1-pro-preview']));
+    // A single `gemini*` pattern marks every gemini id; gpt-5 stays base-only.
+    const out = addOneMVariants(entries, ['gemini*']);
     assert.deepEqual(
         out.map((m) => m.id),
-        ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview[1m]', 'gpt-5'],
-        'a [1m] variant is appended right after the matching base entry; unlisted ids untouched'
+        [
+            'gemini-3.1-pro-preview', 'gemini-3.1-pro-preview[1m]',
+            'gemini-3-flash-preview', 'gemini-3-flash-preview[1m]',
+            'gpt-5',
+        ],
+        'a [1m] variant is appended right after each matching base entry; unmatched ids untouched'
     );
-    const variant = out[1];
-    assert.equal(variant.display_name, 'gemini-3.1-pro-preview (1M context)');
-    assert.equal(variant.type, 'model', 'other fields carried over');
+    assert.equal(out[1].display_name, 'gemini-3.1-pro-preview (1M context)');
+    assert.equal(out[1].type, 'model', 'other fields carried over');
 
-    // Empty set -> no variants; inputs never mutated.
-    assert.equal(addOneMVariants(entries, new Set()).length, 2);
-    assert.equal(entries.length, 2, 'input array not mutated');
+    // Empty patterns -> no variants; inputs never mutated.
+    assert.equal(addOneMVariants(entries, []).length, 3);
+    assert.equal(entries.length, 3, 'input array not mutated');
 
     closeProxy(proxy);
 });
@@ -2487,7 +2509,7 @@ test('M7 — MODELS_1M adds a [1m] variant to GET /v1/models (base + variant, bo
         LITELLM_FALLBACK_OPUS: 'opus-fb',
         LITELLM_FALLBACK_SONNET: 'sonnet-fb',
         LITELLM_FALLBACK_HAIKU: 'haiku-fb',
-        MODELS_1M: 'gemini-3.1-pro-preview', // only gemini gets a 1M variant
+        MODELS_1M: 'gemini*', // prefix glob: every gemini id gets a 1M variant, gpt-5 does not
         ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
         CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
         PROBE_INTERVAL_MS: '999999',
