@@ -55,6 +55,14 @@ const MODELS_FETCH_TIMEOUT_MS = 10000; // per-upstream cap for the models-list f
 // request before routing. Anthropic never ships a model under this prefix.
 const REMAP_PREFIX = 'claude-router-';
 
+// Claude Code reads the 1M context window off a literal `[1m]` suffix in the model
+// name (regex /\[1m\]/i) and, when present, also adds this beta header to the request.
+// We can therefore offer a 1M variant of a foreign model by exposing `<id>[1m]` — but
+// the suffix must be stripped back off on the inbound request (Composer/LiteLLM don't
+// understand it), and the beta header must NOT be forwarded to a non-Anthropic backend.
+const ONE_M_SUFFIX = '[1m]';
+const ONE_M_BETA = 'context-1m-2025-08-07';
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -184,6 +192,11 @@ const config = {
     // model-selection dialog offer Composer alongside Anthropic + LiteLLM models. The ids
     // must match the composer-* routing pattern so a picked id round-trips to forwardToComposer.
     composerModels: process.env.COMPOSER_MODELS || 'composer-2.5',
+    // Comma-separated REAL model ids (LiteLLM or Composer, as they route — i.e. post-demap)
+    // that should ALSO be offered as a `[1m]` 1M-context variant in GET /v1/models. Opt-in:
+    // only models whose backend genuinely supports a 1M window belong here, since the suffix
+    // makes Claude Code treat the model as 1M-token locally. Default empty (no 1M variants).
+    models1m: process.env.MODELS_1M || '',
 };
 
 const FEATURE_ENABLED = !!config.litellmUrl;
@@ -405,14 +418,49 @@ function remapModelId(id) {
 }
 
 // demapModelId(name) — recover the real underlying model id from a remapped name.
-// No-op for names that were never remapped (real claude/anthropic ids, or a real
-// foreign id sent directly via `--model`), so it is always safe to call. Inverse of
-// remapModelId for the set of ids remapModelId actually rewrites.
+// Strips the REMAP_PREFIX and, if present, the trailing `[1m]` 1M-context marker that
+// the dialog adds to the id (the real backend model carries neither). ONLY touches ids
+// in our claude-router-* namespace — a native `claude-opus-4-8[1m]` has no prefix and is
+// returned untouched, so genuine Anthropic 1M requests are never altered. No-op for any
+// name that was never remapped, so it is always safe to call.
 function demapModelId(name) {
-    if (typeof name === 'string' && name.startsWith(REMAP_PREFIX)) {
-        return name.slice(REMAP_PREFIX.length);
+    if (typeof name !== 'string' || !name.startsWith(REMAP_PREFIX)) return name;
+    let real = name.slice(REMAP_PREFIX.length);
+    if (real.toLowerCase().endsWith(ONE_M_SUFFIX)) real = real.slice(0, -ONE_M_SUFFIX.length);
+    return real;
+}
+
+// addOneMVariants(entries, oneMSet) — for each entry whose (real) id is in oneMSet,
+// append an extra entry carrying the `[1m]` suffix so Claude Code offers a 1M-context
+// variant in the dialog. Operates on real-id entries (before remapping). The variant's
+// display_name gets a "(1M context)" tag. Never mutates inputs.
+function addOneMVariants(entries, oneMSet) {
+    if (!Array.isArray(entries)) return [];
+    const out = [];
+    for (const e of entries) {
+        out.push(e);
+        if (e && typeof e.id === 'string' && oneMSet && oneMSet.has(e.id)) {
+            out.push({
+                ...e,
+                id: e.id + ONE_M_SUFFIX,
+                display_name: `${e.display_name || e.id} (1M context)`,
+            });
+        }
     }
-    return name;
+    return out;
+}
+
+// withoutBeta(headerValue, token) — remove one beta token from a comma-separated
+// `anthropic-beta` header value (case-insensitive), preserving the rest. Returns the
+// new value, or null when nothing remains (caller deletes the header). Pure.
+function withoutBeta(headerValue, token) {
+    if (typeof headerValue !== 'string' || !headerValue) return null;
+    const kept = headerValue
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((t) => t.toLowerCase() !== token.toLowerCase());
+    return kept.length ? kept.join(',') : null;
 }
 
 // remapEntries(entries) — return copies of ModelInfo entries with their `id` remapped
@@ -1207,6 +1255,9 @@ async function handleModelsList(clientReq, clientRes) {
     }
     const anthropicData = anthJson && Array.isArray(anthJson.data) ? anthJson.data : [];
 
+    // Real ids (post-demap) that also get a [1m] 1M-context variant offered.
+    const oneMSet = new Set(config.models1m.split(',').map((s) => s.trim()).filter(Boolean));
+
     // --- 2. LiteLLM upstream (when enabled) -----------------------------------
     let litellmData = [];
     if (FEATURE_ENABLED) {
@@ -1229,9 +1280,11 @@ async function handleModelsList(clientReq, clientRes) {
                 const llBody = decompressBody(ll.bodyBuf, ll.headers['content-encoding']);
                 const llJson = JSON.parse(llBody.toString('utf8'));
                 const items = Array.isArray(llJson && llJson.data) ? llJson.data : [];
-                // Translate, then remap ids into the claude-router-* namespace so the
-                // dialog filter accepts them (real id recovered on the inbound request).
-                litellmData = remapEntries(items.map(openAIModelToAnthropic).filter(Boolean));
+                // Translate → add opt-in [1m] variants (on real ids) → remap ids into the
+                // claude-router-* namespace so the dialog filter accepts them. The real id
+                // (and any [1m] suffix) is recovered on the inbound request.
+                const real = addOneMVariants(items.map(openAIModelToAnthropic).filter(Boolean), oneMSet);
+                litellmData = remapEntries(real);
             } else {
                 console.warn(`[proxy] models-list: LiteLLM /v1/models returned ${ll.status} — skipping LiteLLM models`);
             }
@@ -1242,7 +1295,9 @@ async function handleModelsList(clientReq, clientRes) {
     }
 
     // --- 3. Composer (synthetic, when enabled) --------------------------------
-    const composerData = COMPOSER_ENABLED ? remapEntries(composerModelEntries(config)) : [];
+    const composerData = COMPOSER_ENABLED
+        ? remapEntries(addOneMVariants(composerModelEntries(config), oneMSet))
+        : [];
 
     // --- 4. Merge + respond ----------------------------------------------------
     const merged = mergeModelLists(anthropicData, litellmData, composerData);
@@ -1322,12 +1377,19 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
     // the claude-router-* wrapper (see remapModelId). Recover the real id and rewrite the
     // body so every downstream forwarder (composer / litellm) sends the underlying model.
     // No-op for normal claude requests and for real foreign ids sent directly via --model.
-    if (parsed && typeof parsed.model === 'string') {
-        const real = demapModelId(parsed.model);
-        if (real !== parsed.model) {
-            console.log(`[proxy] demap: ${parsed.model} -> ${real}`);
-            parsed.model = real;
-            bodyBuf = rewriteModelInBody(bodyBuf, real); // re-serialize with the real id
+    if (parsed && typeof parsed.model === 'string' && parsed.model.startsWith(REMAP_PREFIX)) {
+        const real = demapModelId(parsed.model); // strips prefix + any trailing [1m]
+        console.log(`[proxy] demap: ${parsed.model} -> ${real}`);
+        parsed.model = real;
+        bodyBuf = rewriteModelInBody(bodyBuf, real); // re-serialize with the real id
+        // A foreign model is never an Anthropic-1M model: drop the context-1m beta header
+        // (Claude Code adds it whenever the selected name carried `[1m]`) so Composer/LiteLLM
+        // don't receive a beta they don't understand. Native claude-*[1m] requests skip this
+        // block entirely (no REMAP_PREFIX) and keep their header intact.
+        if ('anthropic-beta' in clientReq.headers) {
+            const next = withoutBeta(clientReq.headers['anthropic-beta'], ONE_M_BETA);
+            if (next === null) delete clientReq.headers['anthropic-beta'];
+            else clientReq.headers['anthropic-beta'] = next;
         }
     }
 
@@ -1632,6 +1694,8 @@ if (require.main === module) {
         remapModelId,
         demapModelId,
         remapEntries,
+        addOneMVariants,
+        withoutBeta,
         // Composer config visibility (tests only)
         COMPOSER_ENABLED,
         _composerParsed: () => composerParsed,

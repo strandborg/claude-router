@@ -224,6 +224,21 @@ claude-opus-4-7 (litellm)→  claude-opus-4-7        (already accepted — left 
 
 Only the `id` is wrapped; `display_name` keeps the real model name, so the picker stays readable. When a request later arrives with a `claude-router-*` model, the router **demaps it back to the real id and rewrites the request body** before routing, so the underlying backend (Composer / LiteLLM) receives the genuine model name and the dispatch rules below classify it correctly. Demapping is a no-op for ordinary `claude-*` requests and for real foreign ids you send directly (e.g. `claude --model gemini-3.1-pro-preview` still works unchanged). `claude-router-` is a reserved prefix — Anthropic ships no model under it.
 
+#### 1M-context variants (`[1m]`)
+
+Claude Code reads a model's context window from a literal `[1m]` suffix in the id (`/\[1m\]/i` → 1,000,000 tokens) and, when it sees one, also adds the `context-1m-2025-08-07` beta header to the request. The router can offer a 1M variant of a foreign model by listing a second `[1m]`-suffixed entry — set `MODELS_1M` to the comma-separated **real** ids (post-demap) that should get one:
+
+```
+MODELS_1M=gemini-3.1-pro-preview,composer-2.5
+```
+
+For each listed model the merged list gains an extra entry — e.g. `claude-router-gemini-3.1-pro-preview[1m]`, shown as `gemini-3.1-pro-preview (1M context)` — alongside the default 200K base entry. When such a variant is selected:
+
+- **The `[1m]` suffix is stripped on demap** (along with the prefix), so the backend gets the plain real id — `claude-router-gemini-3.1-pro-preview[1m]` → `gemini-3.1-pro-preview`.
+- **The `context-1m-2025-08-07` beta header is dropped** before forwarding to LiteLLM/Composer, since those backends don't understand it (unrelated betas are preserved).
+
+`MODELS_1M` is opt-in and defaults to empty — only add models whose backend genuinely serves a large window, since the suffix makes Claude Code treat the model as 1M-token locally (affecting compaction/usage math). This applies **only** to the router's `claude-router-*` namespace: a native `claude-opus-4-8[1m]` request has no prefix, so its id and its 1M beta header pass through to Anthropic completely untouched.
+
 **Client-side caveat.** Whether the *dialog* renders these entries still depends on the Claude Code build: model discovery is also gated client-side, and surfacing the list may additionally require the relevant flag (e.g. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) or an `availableModels` allowlist entry, depending on version. The remapping removes the `^(claude|anthropic)` id-filter obstacle; the router serving a correct, filter-passing merged `/v1/models` is the provider-agnostic, forward-compatible piece.
 
 ## Routing reference
