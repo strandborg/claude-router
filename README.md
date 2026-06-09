@@ -8,7 +8,7 @@ A local HTTP router for Claude Code. Routes each request to either `api.anthropi
 
 ## What it does
 
-The router has three capabilities that can be used independently:
+The router has four capabilities that can be used independently:
 
 1. **Quota visibility** — always on. Forwards every request to Anthropic unchanged, scrapes the `anthropic-ratelimit-*` response headers, and writes a one-line status file at `~/.claude/usage-status.md`. Claude reads that file to know how close it is to the 5-hour, 7-day, and overage limits.
 
@@ -16,7 +16,9 @@ The router has three capabilities that can be used independently:
 
 3. **Composer 2.5** — opt-in via `CURSOR_API_KEY`. Routes requests to Cursor's Composer 2.5 model via native Anthropic↔OpenAI translation, enabling Claude Code to use Composer as an alternative model alongside Anthropic and LiteLLM options. Switch by naming any model matching `composer-*` (e.g. `composer-2.5`).
 
-If both `LITELLM_URL` and `CURSOR_API_KEY` are unset, claude-router is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe.
+4. **Model-list aggregation** — automatic whenever LiteLLM and/or Composer is enabled. Intercepts `GET /v1/models` (the Anthropic Models API endpoint that backs Claude Code's model-selection dialog) and returns a single merged list: Anthropic's own models, plus every LiteLLM model (translated to Anthropic shape), plus synthetic Composer entries. Without this, the dialog only ever sees Anthropic models.
+
+If both `LITELLM_URL` and `CURSOR_API_KEY` are unset, claude-router is byte-identical to a pure passthrough: no body buffering, no model inspection, no background probe, and `GET /v1/models` forwards straight to Anthropic.
 
 ## How it works
 
@@ -188,6 +190,7 @@ The Composer feature activates only when `CURSOR_API_KEY` is set. All other vari
 |----------|---------|---------|
 | `CURSOR_API_KEY` | Bearer token sent on every Composer-bound request. **Feature gate** — unset disables Composer. Obtain from Cursor Dashboard → Integrations. | unset |
 | `COMPOSER_API_URL` | Composer API base URL. **Host-only** — scheme, host, and port are used; any path component in the URL is ignored, since the fixed route `/opencodev2/v1/chat/completions` is always appended. | `https://cursor-api.standardagents.ai` |
+| `COMPOSER_MODELS` | Comma-separated Composer model ids surfaced in the merged `GET /v1/models` list (see below). Each id must match the `composer-*` routing pattern so a selected id round-trips back to Composer. | `composer-2.5` |
 
 **How to use:** Set your `CURSOR_API_KEY` from the Cursor Dashboard (Integrations section), then in Claude Code select a model name starting with `composer` — e.g. type `composer-2.5` when prompted for a model. The router translates your Anthropic Messages API request to OpenAI chat-completions format, forwards it to Composer, and translates the response back. Streaming is fully supported.
 
@@ -196,6 +199,20 @@ The Composer feature activates only when `CURSOR_API_KEY` is set. All other vari
 - Image input is best-effort; some image formats may not round-trip perfectly.
 - Token usage is estimated by composer-api and displayed for reference only — it does not update the `~/.claude/usage-status.md` quota file.
 - Composer is **explicit-only** — it is never used as a quota fallback target when `LITELLM_URL` is configured. Name `composer-*` explicitly to route to Composer.
+
+### Model-list aggregation (`GET /v1/models`)
+
+Claude Code's model-selection dialog is backed by the Anthropic **Models API** — `GET /v1/models`, which returns `{ data: [{ type, id, display_name, created_at, … }], has_more, first_id, last_id }`. By default the router forwards that request straight to Anthropic, so the dialog only lists Anthropic's own models.
+
+Whenever LiteLLM and/or Composer is enabled, the router instead **intercepts `GET /v1/models`** and answers with a merged list:
+
+1. **Anthropic** is fetched first and is the source of truth. It is also the auth gate: a non-2xx Anthropic response (e.g. `401`) is passed through verbatim, so credential errors still surface correctly. The response's `anthropic-ratelimit-*` headers are scraped exactly as on any other Anthropic call, so quota tracking keeps working off model-list traffic.
+2. **LiteLLM** models are fetched from `GET {LITELLM_URL}/v1/models` (OpenAI-shaped) and translated to Anthropic `ModelInfo` objects. A LiteLLM outage is non-fatal — those models are simply omitted.
+3. **Composer** models are appended synthetically from `COMPOSER_MODELS` (Composer exposes no model list of its own).
+
+Entries are concatenated in that priority order and de-duplicated by `id` (so a LiteLLM-exposed `claude-*` won't shadow the native Anthropic entry). The merged response always sets `has_more: false` — pagination is collapsed into a single page. Each selectable `id` is exactly what Claude Code sends back as the request `model`, so a picked LiteLLM/Composer id routes correctly through the rules above.
+
+**Client-side caveat.** Whether the *dialog* renders these extra entries depends on the Claude Code build: model discovery is gated client-side (and some discovery paths filter to `^(claude|anthropic)` ids). The router serving a correct merged `/v1/models` is the provider-agnostic, forward-compatible piece; surfacing non-Anthropic ids in the picker may additionally require the relevant Claude Code flag (e.g. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) or an `availableModels` allowlist entry, depending on version.
 
 ## Routing reference
 
@@ -216,7 +233,7 @@ The Composer feature activates only when `CURSOR_API_KEY` is set. All other vari
 
 Tier classification is by case-insensitive substring match: a model name containing `opus` is opus-tier, `sonnet` is sonnet-tier, `haiku` is haiku-tier. Anything else starting with `claude-` is "unknown tier".
 
-Endpoints other than `/v1/messages` and `/v1/messages/count_tokens` always go to Anthropic without body inspection.
+`GET /v1/models` is intercepted and answered with a merged model list (see [Model-list aggregation](#model-list-aggregation-get-v1models)) whenever LiteLLM and/or Composer is enabled; otherwise, and for every other endpoint, requests go to Anthropic without body inspection.
 
 ### Redirect engagement
 

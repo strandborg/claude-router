@@ -42,6 +42,12 @@ const HOP_BY_HOP_STATIC = new Set([
 
 const BODY_BEARING_PATHS = new Set(['/v1/messages', '/v1/messages/count_tokens']);
 
+// GET on this exact path (query stripped) is intercepted and answered with a merged
+// model list aggregated across every backend the router knows (Anthropic + LiteLLM +
+// Composer). Anything else under /v1/models/* (e.g. retrieve by id) is left to passthrough.
+const MODELS_LIST_PATH = '/v1/models';
+const MODELS_FETCH_TIMEOUT_MS = 10000; // per-upstream cap for the models-list fan-out
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -166,6 +172,11 @@ const config = {
     // Composer 2.5 backend (opt-in, independent of litellm). Enabled iff CURSOR_API_KEY set.
     composerApiUrl: process.env.COMPOSER_API_URL || 'https://cursor-api.standardagents.ai',
     cursorApiKey: process.env.CURSOR_API_KEY || '',
+    // Comma-separated composer model ids surfaced in the GET /v1/models aggregation.
+    // These are synthetic (Composer exposes no Anthropic-shaped model list) — they let the
+    // model-selection dialog offer Composer alongside Anthropic + LiteLLM models. The ids
+    // must match the composer-* routing pattern so a picked id round-trips to forwardToComposer.
+    composerModels: process.env.COMPOSER_MODELS || 'composer-2.5',
 };
 
 const FEATURE_ENABLED = !!config.litellmUrl;
@@ -368,6 +379,76 @@ function mapFinishReason(fr) {
 
 function randomMsgId() {
     return 'msg_' + Math.random().toString(36).slice(2, 14);
+}
+
+// ---------------------------------------------------------------------------
+// Model-list aggregation (GET /v1/models) — pure helpers
+// Translate foreign model descriptors into the Anthropic Models API `ModelInfo`
+// shape so a single merged list can be returned to the client. Pure: no I/O.
+// ---------------------------------------------------------------------------
+
+// openAIModelToAnthropic(m) — map one OpenAI/LiteLLM `/v1/models` entry to an
+// Anthropic ModelInfo. LiteLLM returns OpenAI-shaped objects: { id, object:'model',
+// created (unix seconds), owned_by }. Returns null when there is no usable id.
+function openAIModelToAnthropic(m) {
+    if (!m || typeof m.id !== 'string' || m.id.length === 0) return null;
+    let createdAt = '2025-01-01T00:00:00Z';
+    if (typeof m.created === 'number' && Number.isFinite(m.created)) {
+        // OpenAI `created` is unix seconds; ms = *1000. Guard against absurd values.
+        try {
+            const d = new Date(m.created * 1000);
+            if (!isNaN(d.getTime())) createdAt = d.toISOString();
+        } catch { /* keep default */ }
+    }
+    return {
+        type: 'model',
+        id: m.id,
+        // No human label is available from the OpenAI list shape — surface the id,
+        // which is also exactly what the client must send back as `model`.
+        display_name: m.id,
+        created_at: createdAt,
+    };
+}
+
+// composerModelEntries(cfg) — synthesize Anthropic ModelInfo entries for Composer.
+// Composer exposes no Anthropic-shaped model list, so the ids come from config
+// (COMPOSER_MODELS, comma-separated). Ids must match the composer-* routing pattern.
+function composerModelEntries(cfg) {
+    const raw = (cfg && cfg.composerModels) || '';
+    return raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((id) => {
+            // "composer-2.5" -> "Composer 2.5"; anything else falls back to the id.
+            let displayName = id;
+            const m = /^composer[-/](.+)$/i.exec(id);
+            if (m) displayName = `Composer ${m[1]}`;
+            return {
+                type: 'model',
+                id,
+                display_name: displayName,
+                created_at: '2025-01-01T00:00:00Z',
+            };
+        });
+}
+
+// mergeModelLists(anthropicData, litellmData, composerData) — concatenate the three
+// sources in priority order (Anthropic first, then LiteLLM, then Composer), dropping
+// later entries whose id was already seen. Inputs are arrays of ModelInfo objects.
+// Returns a fresh array; never mutates inputs.
+function mergeModelLists(anthropicData, litellmData, composerData) {
+    const out = [];
+    const seen = new Set();
+    for (const list of [anthropicData, litellmData, composerData]) {
+        if (!Array.isArray(list)) continue;
+        for (const entry of list) {
+            if (!entry || typeof entry.id !== 'string' || seen.has(entry.id)) continue;
+            seen.add(entry.id);
+            out.push(entry);
+        }
+    }
+    return out;
 }
 
 // anthropicToOpenAIRequest(parsed) — translate a parsed Anthropic Messages request body
@@ -1008,6 +1089,146 @@ function forwardToComposer(clientReq, clientRes, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Model-list aggregation (GET /v1/models) — I/O
+// ---------------------------------------------------------------------------
+
+// fetchJsonOnce(requester, options) — issue a bodyless GET and buffer the full
+// response. Resolves { status, headers, bodyBuf } (decompression is the caller's
+// concern). Rejects only on transport error/timeout. `options.timeout` arms the
+// socket timeout; we destroy on fire so the promise rejects rather than hangs.
+function fetchJsonOnce(requester, options) {
+    return new Promise((resolve, reject) => {
+        const req = requester.request(options, (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, bodyBuf: Buffer.concat(chunks) }));
+            res.on('error', reject);
+        });
+        req.on('timeout', () => req.destroy(new Error('models fetch timed out')));
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+// handleModelsList — intercept GET /v1/models and answer with a list merged across
+// every backend the router knows. Anthropic is the source of truth (and the auth
+// gate): on a non-2xx Anthropic response we pass it through verbatim so 401/403/etc.
+// surface unchanged. On success we append translated LiteLLM models (when enabled)
+// and synthetic Composer models (when enabled), de-duplicated by id.
+async function handleModelsList(clientReq, clientRes) {
+    // --- 1. Anthropic upstream (always) ---------------------------------------
+    const hostHeader = config.anthropicPort === 443
+        ? config.anthropicHost
+        : `${config.anthropicHost}:${config.anthropicPort}`;
+
+    // Preserve the client's `beta` flag but force a large page so we get the full
+    // set in one shot (we collapse pagination by returning has_more:false below).
+    let beta = false;
+    try {
+        const q = new URL(clientReq.url, 'http://placeholder').searchParams;
+        beta = q.get('beta') === 'true';
+    } catch { /* malformed query — treat as no beta */ }
+    const anthPath = `/v1/models?limit=1000${beta ? '&beta=true' : ''}`;
+
+    const anthHeaders = { ...stripHopByHop(clientReq.headers), host: hostHeader, 'accept-encoding': 'identity' };
+    delete anthHeaders['content-length']; // GET carries no body
+
+    let anth;
+    try {
+        anth = await fetchJsonOnce(https, {
+            hostname: config.anthropicHost,
+            port: config.anthropicPort,
+            path: anthPath,
+            method: 'GET',
+            headers: anthHeaders,
+            timeout: MODELS_FETCH_TIMEOUT_MS,
+        });
+    } catch (err) {
+        console.error('[proxy] models-list: Anthropic fetch failed:', err.message);
+        if (!clientRes.headersSent) clientRes.writeHead(502, { 'content-type': 'application/json' });
+        return clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'models list: anthropic fetch failed' } }));
+    }
+
+    // Scrape rate-limit headers from this real Anthropic response (same as any other
+    // Anthropic call) so quota visibility / mode flips keep working off model-list traffic.
+    writeUsageFile(anth.headers);
+
+    const anthBody = decompressBody(anth.bodyBuf, anth.headers['content-encoding']);
+
+    // Non-2xx → pass through verbatim (preserve auth errors etc.).
+    if (anth.status < 200 || anth.status >= 300) {
+        const passHeaders = stripHopByHop(anth.headers);
+        passHeaders['content-length'] = Buffer.byteLength(anthBody);
+        if (!clientRes.headersSent) clientRes.writeHead(anth.status, passHeaders);
+        return clientRes.end(anthBody);
+    }
+
+    let anthJson = null;
+    try {
+        anthJson = JSON.parse(anthBody.toString('utf8'));
+    } catch {
+        console.warn('[proxy] models-list: Anthropic returned 2xx with unparseable body — continuing with extra sources only');
+    }
+    const anthropicData = anthJson && Array.isArray(anthJson.data) ? anthJson.data : [];
+
+    // --- 2. LiteLLM upstream (when enabled) -----------------------------------
+    let litellmData = [];
+    if (FEATURE_ENABLED) {
+        try {
+            const requester = litellmParsed.protocol === 'https:' ? https : http;
+            const ll = await fetchJsonOnce(requester, {
+                hostname: litellmParsed.hostname,
+                port: litellmParsed.port,
+                path: '/v1/models',
+                method: 'GET',
+                headers: {
+                    host: litellmParsed.hostHeader,
+                    authorization: `Bearer ${config.litellmApiKey}`,
+                    accept: 'application/json',
+                    'accept-encoding': 'identity',
+                },
+                timeout: MODELS_FETCH_TIMEOUT_MS,
+            });
+            if (ll.status >= 200 && ll.status < 300) {
+                const llBody = decompressBody(ll.bodyBuf, ll.headers['content-encoding']);
+                const llJson = JSON.parse(llBody.toString('utf8'));
+                const items = Array.isArray(llJson && llJson.data) ? llJson.data : [];
+                litellmData = items.map(openAIModelToAnthropic).filter(Boolean);
+            } else {
+                console.warn(`[proxy] models-list: LiteLLM /v1/models returned ${ll.status} — skipping LiteLLM models`);
+            }
+        } catch (err) {
+            // Non-fatal: the dialog still gets Anthropic (+ Composer) models.
+            console.warn('[proxy] models-list: LiteLLM fetch failed, skipping LiteLLM models:', err.message);
+        }
+    }
+
+    // --- 3. Composer (synthetic, when enabled) --------------------------------
+    const composerData = COMPOSER_ENABLED ? composerModelEntries(config) : [];
+
+    // --- 4. Merge + respond ----------------------------------------------------
+    const merged = mergeModelLists(anthropicData, litellmData, composerData);
+    const out = JSON.stringify({
+        data: merged,
+        has_more: false,
+        first_id: merged.length ? merged[0].id : null,
+        last_id: merged.length ? merged[merged.length - 1].id : null,
+    });
+
+    if (FEATURE_ENABLED || COMPOSER_ENABLED) {
+        console.log(`[proxy] models-list: anthropic=${anthropicData.length} litellm=${litellmData.length} composer=${composerData.length} merged=${merged.length}`);
+    }
+
+    if (!clientRes.headersSent) {
+        clientRes.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(out),
+        });
+    }
+    clientRes.end(out);
+}
+
+// ---------------------------------------------------------------------------
 // Body buffering + routing
 // ---------------------------------------------------------------------------
 
@@ -1127,6 +1348,22 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
 
 function dispatchWithFeature(clientReq, clientRes) {
     const urlPath = (clientReq.url || '').split('?')[0];
+
+    // Model-selection dialog: aggregate models across all backends. Only intercepted
+    // when a feature is on (this function is unreachable in pure-passthrough mode), so
+    // a feature-off router still forwards GET /v1/models straight to Anthropic.
+    // handleModelsList never rejects (it try/catches internally), but guard anyway so a
+    // surprise rejection can't surface as an unhandled promise.
+    if (clientReq.method === 'GET' && urlPath === MODELS_LIST_PATH) {
+        return handleModelsList(clientReq, clientRes).catch((err) => {
+            console.error('[proxy] models-list: unexpected handler error:', err.message);
+            if (!clientRes.headersSent) {
+                clientRes.writeHead(502, { 'content-type': 'application/json' });
+            }
+            clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'models list failed' } }));
+        });
+    }
+
     const needsInspection = clientReq.method === 'POST' && BODY_BEARING_PATHS.has(urlPath);
 
     if (!needsInspection) {
@@ -1337,6 +1574,10 @@ if (require.main === module) {
         makeSSETranslator,
         flattenAnthropicText,
         mapFinishReason,
+        // Model-list aggregation helpers (pure) — test seam
+        openAIModelToAnthropic,
+        composerModelEntries,
+        mergeModelLists,
         // Composer config visibility (tests only)
         COMPOSER_ENABLED,
         _composerParsed: () => composerParsed,
