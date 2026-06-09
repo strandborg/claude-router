@@ -210,9 +210,21 @@ Whenever LiteLLM and/or Composer is enabled, the router instead **intercepts `GE
 2. **LiteLLM** models are fetched from `GET {LITELLM_URL}/v1/models` (OpenAI-shaped) and translated to Anthropic `ModelInfo` objects. A LiteLLM outage is non-fatal — those models are simply omitted.
 3. **Composer** models are appended synthetically from `COMPOSER_MODELS` (Composer exposes no model list of its own).
 
-Entries are concatenated in that priority order and de-duplicated by `id` (so a LiteLLM-exposed `claude-*` won't shadow the native Anthropic entry). The merged response always sets `has_more: false` — pagination is collapsed into a single page. Each selectable `id` is exactly what Claude Code sends back as the request `model`, so a picked LiteLLM/Composer id routes correctly through the rules above.
+Entries are concatenated in that priority order and de-duplicated by `id` (so a LiteLLM-exposed `claude-*` won't shadow the native Anthropic entry). The merged response always sets `has_more: false` — pagination is collapsed into a single page.
 
-**Client-side caveat.** Whether the *dialog* renders these extra entries depends on the Claude Code build: model discovery is gated client-side (and some discovery paths filter to `^(claude|anthropic)` ids). The router serving a correct merged `/v1/models` is the provider-agnostic, forward-compatible piece; surfacing non-Anthropic ids in the picker may additionally require the relevant Claude Code flag (e.g. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) or an `availableModels` allowlist entry, depending on version.
+#### Name remapping (`claude-router-` prefix)
+
+Claude Code's model-selection dialog only accepts model ids matching `^(claude|anthropic)` — so a raw `gemini-3.1-pro-preview` or `composer-2.5` would be filtered out. To get them accepted, the router **remaps every foreign id** (any id not already starting with `claude`/`anthropic`) into a reserved namespace before listing it:
+
+```
+gemini-3.1-pro-preview   →  claude-router-gemini-3.1-pro-preview
+composer-2.5             →  claude-router-composer-2.5
+claude-opus-4-7 (litellm)→  claude-opus-4-7        (already accepted — left as-is)
+```
+
+Only the `id` is wrapped; `display_name` keeps the real model name, so the picker stays readable. When a request later arrives with a `claude-router-*` model, the router **demaps it back to the real id and rewrites the request body** before routing, so the underlying backend (Composer / LiteLLM) receives the genuine model name and the dispatch rules below classify it correctly. Demapping is a no-op for ordinary `claude-*` requests and for real foreign ids you send directly (e.g. `claude --model gemini-3.1-pro-preview` still works unchanged). `claude-router-` is a reserved prefix — Anthropic ships no model under it.
+
+**Client-side caveat.** Whether the *dialog* renders these entries still depends on the Claude Code build: model discovery is also gated client-side, and surfacing the list may additionally require the relevant flag (e.g. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) or an `availableModels` allowlist entry, depending on version. The remapping removes the `^(claude|anthropic)` id-filter obstacle; the router serving a correct, filter-passing merged `/v1/models` is the provider-agnostic, forward-compatible piece.
 
 ## Routing reference
 
@@ -220,6 +232,7 @@ Entries are concatenated in that priority order and de-duplicated by `id` (so a 
 
 | Request body `model` | Quota state | Upstream | Body rewritten? |
 |---|---|---|---|
+| `claude-router-*` (remapped dialog pick) | any | demapped to real id, then re-classified by the rows below | yes → real id |
 | `claude-opus-*` | below threshold | Anthropic | no |
 | `claude-sonnet-*` | below threshold | Anthropic | no |
 | `claude-haiku-*` | below threshold | Anthropic | no |

@@ -48,6 +48,13 @@ const BODY_BEARING_PATHS = new Set(['/v1/messages', '/v1/messages/count_tokens']
 const MODELS_LIST_PATH = '/v1/models';
 const MODELS_FETCH_TIMEOUT_MS = 10000; // per-upstream cap for the models-list fan-out
 
+// Reserved namespace for foreign (LiteLLM / Composer) model ids surfaced in the
+// merged GET /v1/models list. Claude Code's model-selection dialog only accepts ids
+// matching /^(claude|anthropic)/i, so foreign ids are exposed wrapped in this prefix
+// (which begins with `claude-`) and demapped back to the real id on the inbound
+// request before routing. Anthropic never ships a model under this prefix.
+const REMAP_PREFIX = 'claude-router-';
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -386,6 +393,35 @@ function randomMsgId() {
 // Translate foreign model descriptors into the Anthropic Models API `ModelInfo`
 // shape so a single merged list can be returned to the client. Pure: no I/O.
 // ---------------------------------------------------------------------------
+
+// remapModelId(id) — wrap a foreign model id so it passes Claude Code's
+// /^(claude|anthropic)/i dialog filter. Ids that already start with claude/anthropic
+// are returned unchanged (they pass the filter and their routing is already meaningful);
+// everything else is prefixed with REMAP_PREFIX. Inverse of demapModelId.
+function remapModelId(id) {
+    if (typeof id !== 'string' || id.length === 0) return id;
+    if (/^(claude|anthropic)/i.test(id)) return id;
+    return REMAP_PREFIX + id;
+}
+
+// demapModelId(name) — recover the real underlying model id from a remapped name.
+// No-op for names that were never remapped (real claude/anthropic ids, or a real
+// foreign id sent directly via `--model`), so it is always safe to call. Inverse of
+// remapModelId for the set of ids remapModelId actually rewrites.
+function demapModelId(name) {
+    if (typeof name === 'string' && name.startsWith(REMAP_PREFIX)) {
+        return name.slice(REMAP_PREFIX.length);
+    }
+    return name;
+}
+
+// remapEntries(entries) — return copies of ModelInfo entries with their `id` remapped
+// for dialog exposure. `display_name` is left untouched so the picker still shows the
+// real, human-recognizable model name. Never mutates the inputs.
+function remapEntries(entries) {
+    if (!Array.isArray(entries)) return [];
+    return entries.map((e) => (e && typeof e.id === 'string' ? { ...e, id: remapModelId(e.id) } : e));
+}
 
 // openAIModelToAnthropic(m) — map one OpenAI/LiteLLM `/v1/models` entry to an
 // Anthropic ModelInfo. LiteLLM returns OpenAI-shaped objects: { id, object:'model',
@@ -1193,7 +1229,9 @@ async function handleModelsList(clientReq, clientRes) {
                 const llBody = decompressBody(ll.bodyBuf, ll.headers['content-encoding']);
                 const llJson = JSON.parse(llBody.toString('utf8'));
                 const items = Array.isArray(llJson && llJson.data) ? llJson.data : [];
-                litellmData = items.map(openAIModelToAnthropic).filter(Boolean);
+                // Translate, then remap ids into the claude-router-* namespace so the
+                // dialog filter accepts them (real id recovered on the inbound request).
+                litellmData = remapEntries(items.map(openAIModelToAnthropic).filter(Boolean));
             } else {
                 console.warn(`[proxy] models-list: LiteLLM /v1/models returned ${ll.status} — skipping LiteLLM models`);
             }
@@ -1204,7 +1242,7 @@ async function handleModelsList(clientReq, clientRes) {
     }
 
     // --- 3. Composer (synthetic, when enabled) --------------------------------
-    const composerData = COMPOSER_ENABLED ? composerModelEntries(config) : [];
+    const composerData = COMPOSER_ENABLED ? remapEntries(composerModelEntries(config)) : [];
 
     // --- 4. Merge + respond ----------------------------------------------------
     const merged = mergeModelLists(anthropicData, litellmData, composerData);
@@ -1278,6 +1316,19 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
             captureUsage: true,
             reason: 'parse-failed-fail-safe',
         });
+    }
+
+    // Demap: if the client selected a foreign model from the dialog, its `model` carries
+    // the claude-router-* wrapper (see remapModelId). Recover the real id and rewrite the
+    // body so every downstream forwarder (composer / litellm) sends the underlying model.
+    // No-op for normal claude requests and for real foreign ids sent directly via --model.
+    if (parsed && typeof parsed.model === 'string') {
+        const real = demapModelId(parsed.model);
+        if (real !== parsed.model) {
+            console.log(`[proxy] demap: ${parsed.model} -> ${real}`);
+            parsed.model = real;
+            bodyBuf = rewriteModelInBody(bodyBuf, real); // re-serialize with the real id
+        }
     }
 
     const modelName = parsed && typeof parsed.model === 'string' ? parsed.model : null;
@@ -1578,6 +1629,9 @@ if (require.main === module) {
         openAIModelToAnthropic,
         composerModelEntries,
         mergeModelLists,
+        remapModelId,
+        demapModelId,
+        remapEntries,
         // Composer config visibility (tests only)
         COMPOSER_ENABLED,
         _composerParsed: () => composerParsed,

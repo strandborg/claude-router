@@ -2181,15 +2181,17 @@ test('M1 — GET /v1/models merges Anthropic + LiteLLM, dedupes, scrapes quota',
     const ids = body.data.map((m) => m.id);
     assert.deepEqual(
         ids,
-        ['claude-opus-4-8', 'claude-haiku-4-5', 'gemini-3.1-pro-preview', 'gpt-5'],
-        'Anthropic models first, LiteLLM appended, duplicate claude-haiku-4-5 dropped'
+        ['claude-opus-4-8', 'claude-haiku-4-5', 'claude-router-gemini-3.1-pro-preview', 'claude-router-gpt-5'],
+        'Anthropic models first, LiteLLM appended (foreign ids remapped to claude-router-*), duplicate claude-haiku-4-5 dropped'
     );
     assert.equal(body.first_id, 'claude-opus-4-8');
-    assert.equal(body.last_id, 'gpt-5');
-    // Translated LiteLLM entry shape.
-    const gemini = body.data.find((m) => m.id === 'gemini-3.1-pro-preview');
+    assert.equal(body.last_id, 'claude-router-gpt-5');
+    // Every exposed id starts with claude-/anthropic- so Claude Code's dialog filter accepts it.
+    assert.ok(body.data.every((m) => /^(claude|anthropic)/i.test(m.id)), 'all exposed ids pass the ^(claude|anthropic) filter');
+    // Translated LiteLLM entry: remapped id, but display_name keeps the real model name.
+    const gemini = body.data.find((m) => m.id === 'claude-router-gemini-3.1-pro-preview');
     assert.equal(gemini.type, 'model');
-    assert.equal(gemini.display_name, 'gemini-3.1-pro-preview');
+    assert.equal(gemini.display_name, 'gemini-3.1-pro-preview', 'display_name shows the real model name, not the wrapper');
     assert.equal(gemini.created_at, new Date(1730000000 * 1000).toISOString());
 
     // Upstream request hygiene + quota scrape.
@@ -2233,10 +2235,11 @@ test('M2 — GET /v1/models appends synthetic Composer models (litellm off)', as
     assert.equal(result.statusCode, 200);
     const body = JSON.parse(result.body);
     const ids = body.data.map((m) => m.id);
-    assert.deepEqual(ids, ['claude-opus-4-8', 'composer-2.5', 'composer-fast'], 'Composer ids appended after Anthropic');
-    const composer = body.data.find((m) => m.id === 'composer-2.5');
-    assert.equal(composer.display_name, 'Composer 2.5');
-    assert.equal(body.last_id, 'composer-fast');
+    assert.deepEqual(ids, ['claude-opus-4-8', 'claude-router-composer-2.5', 'claude-router-composer-fast'], 'Composer ids appended after Anthropic, remapped to claude-router-*');
+    assert.ok(body.data.every((m) => /^(claude|anthropic)/i.test(m.id)), 'all exposed ids pass the dialog filter');
+    const composer = body.data.find((m) => m.id === 'claude-router-composer-2.5');
+    assert.equal(composer.display_name, 'Composer 2.5', 'display_name unchanged by remap');
+    assert.equal(body.last_id, 'claude-router-composer-fast');
 
     await closeProxy(proxy);
     await anthropic.close();
@@ -2307,4 +2310,112 @@ test('M4 — GET /v1/models tolerates a LiteLLM failure (still returns Anthropic
 
     await closeProxy(proxy);
     await anthropic.close();
+});
+
+test('Unit — remap/demap round-trips and leaves claude/anthropic ids alone', () => {
+    const proxy = requireFreshProxy({});
+    const { remapModelId, demapModelId, remapEntries } = proxy;
+
+    // Foreign ids get wrapped, and the wrapper starts with claude- (passes the dialog filter).
+    for (const id of ['gemini-3.1-pro-preview', 'gpt-5', 'composer-2.5', 'openai/o3-mini']) {
+        const wrapped = remapModelId(id);
+        assert.ok(wrapped.startsWith('claude-'), `${wrapped} passes ^claude filter`);
+        assert.equal(demapModelId(wrapped), id, `round-trips back to ${id}`);
+    }
+
+    // claude-/anthropic-prefixed ids are already accepted -> untouched both ways.
+    for (const id of ['claude-opus-4-8', 'claude-haiku-4-5', 'anthropic/claude-sonnet-4-6']) {
+        assert.equal(remapModelId(id), id, `${id} not remapped`);
+        assert.equal(demapModelId(id), id, `${id} not demapped`);
+    }
+
+    // demap is a no-op for un-prefixed ids (real foreign id sent directly via --model).
+    assert.equal(demapModelId('gpt-5'), 'gpt-5');
+
+    // remapEntries preserves display_name, only rewrites id.
+    const out = remapEntries([{ type: 'model', id: 'gpt-5', display_name: 'gpt-5' }]);
+    assert.equal(out[0].id, 'claude-router-gpt-5');
+    assert.equal(out[0].display_name, 'gpt-5');
+
+    closeProxy(proxy);
+});
+
+test('M5 — picking a remapped Composer model demaps to composer-2.5 and routes to Composer', async () => {
+    let composerCalled = false;
+    let composerBody = null;
+
+    const composer = await mockServer(async (req, res) => {
+        composerCalled = true;
+        composerBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-m5',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-m5',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        // The id Claude Code would send after picking the remapped dialog entry.
+        body: { model: 'claude-router-composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 },
+    });
+
+    assert.equal(result.statusCode, 200, 'request succeeded via Composer');
+    assert.equal(composerCalled, true, 'Composer backend was reached (demapped composer-2.5 matched composer-*)');
+    const sent = JSON.parse(composerBody);
+    assert.equal(sent.model, 'composer-2.5', 'underlying request carries the real composer id, not the wrapper');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+test('M6 — picking a remapped LiteLLM model demaps to the real id and routes to LiteLLM', async () => {
+    let anthropicCalled = false;
+    let litellmBody = null;
+
+    const anthropic = await mockHttpsServer((req, res) => { anthropicCalled = true; res.end('{}'); });
+
+    const litellm = await mockServer(async (req, res) => {
+        litellmBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'x', choices: [] }));
+    });
+
+    const proxy = requireFreshProxy({
+        LITELLM_URL: `http://127.0.0.1:${litellm.port}/`,
+        LITELLM_API_KEY: 'litellm-key-m6',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    proxy._state.quotaState.fiveHourPct = 5; // low quota — non-claude still goes to LiteLLM
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'claude-router-gemini-3.1-pro-preview', messages: [{ role: 'user', content: 'hi' }] },
+    });
+
+    assert.equal(result.statusCode, 200, 'request succeeded via LiteLLM');
+    assert.equal(anthropicCalled, false, 'Anthropic not called (demapped id is non-claude -> LiteLLM)');
+    const sent = JSON.parse(litellmBody);
+    assert.equal(sent.model, 'gemini-3.1-pro-preview', 'underlying request carries the real LiteLLM id, not the wrapper');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await litellm.close();
 });
