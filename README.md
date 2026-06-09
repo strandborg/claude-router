@@ -242,13 +242,33 @@ For each listed model the merged list gains an extra entry — e.g. `claude-rout
 
 #### Making the models appear in `/model`
 
-Serving a correct merged `/v1/models` is only half of it — Claude Code does **not** query that endpoint for the picker unless its **gateway model discovery** is enabled. To turn it on, set this in **Claude Code's own environment** (not the proxy):
+Serving a correct merged `/v1/models` is only half of it. Getting the models into the picker takes two client-side things, plus a cache seed:
+
+**1. Enable gateway model discovery** in **Claude Code's own environment** (not the proxy):
 
 ```
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-Put it wherever Claude Code reads env from — e.g. the `env` block of `~/.claude/settings.json`, or the same shell profile that exports `ANTHROPIC_BASE_URL`. With it set (and a first-party login pointed at a custom `ANTHROPIC_BASE_URL`, i.e. this router), Claude Code calls `GET /v1/models` on the base URL during bootstrap and lists the results — keeping only ids matching `^(claude|anthropic)`, which is exactly why the remapping above exists. **Restart Claude Code after setting it**; discovery runs at startup, so the models show on the next launch (a fresh session may need one bootstrap cycle).
+Put it wherever Claude Code reads env from — e.g. the `env` block of `~/.claude/settings.json`, or the shell profile that exports `ANTHROPIC_BASE_URL`.
+
+**2. Seed the discovery cache.** With discovery enabled, the picker is populated from `<CLAUDE_CONFIG_DIR>/cache/gateway-models.json` (default `~/.claude/cache/gateway-models.json`), **not** from a live `GET /v1/models` — that live fetch only runs for an enterprise gateway-auth setup, which a personal login doesn't have. Worse, Claude Code **discards the whole cache unless its `baseUrl` exactly matches the current `ANTHROPIC_BASE_URL`**. So the router ships a seeder that writes this file with the right `baseUrl` and the same merged/remapped/`[1m]` model set the endpoint serves:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:4080 \
+LITELLM_URL=… LITELLM_API_KEY=… CURSOR_API_KEY=… MODELS_1M='gemini-3*' \
+node seed-gateway-cache.js
+```
+
+Best run automatically on every proxy start — add to the service unit (it already has the env):
+
+```ini
+ExecStartPost=-/usr/bin/node /path/to/claude-router/seed-gateway-cache.js
+```
+
+The seeder reuses the proxy's own helpers, fetches LiteLLM's model list, adds Composer + a stock-Claude baseline, applies the same remap + `[1m]` variants, and writes the cache. A transient LiteLLM outage won't clobber an existing good cache. Knobs: `CLAUDE_CONFIG_DIR`, `SEED_STOCK_MODELS`, `STOCK_1M_MODELS` (see below). **Restart Claude Code** after seeding; reopen `/model` if a stale picker is cached.
+
+**Native Claude 1M under a custom base URL.** Claude Code only serves the 1M window when the model id carries a `[1m]` suffix *unless* it's talking to an official endpoint — pointing it at this router counts as custom, so its automatic "(1M context)" variants for Opus/Sonnet are suppressed. The seeder therefore lists 1M-capable Claude models **both** ways: `Claude Opus 4.8` (200K) and `Claude Opus 4.8 (1M context)` → `claude-opus-4-8[1m]` (1M, routed natively to Anthropic with the `context-1m` beta). The set defaults to `claude-opus-4-8,claude-opus-4-7,claude-opus-4-6,claude-sonnet-4-6`; override with `STOCK_1M_MODELS`. Pick the "(1M context)" entry in `/model` to actually get 1M.
 
 ## Routing reference
 
