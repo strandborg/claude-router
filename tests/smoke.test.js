@@ -158,7 +158,7 @@ function requireFreshProxy(env = {}) {
         'LITELLM_FALLBACK_HAIKU', 'REDIRECT_AT_5H_PCT', 'REDIRECT_AT_7D_PCT',
         'REDIRECT_AT_OVERAGE_PCT', 'PROBE_INTERVAL_MS', 'MAX_BUFFER_BYTES',
         'ANTHROPIC_HOST_OVERRIDE', 'ANTHROPIC_API_KEY_FOR_PROBES', 'CLAUDE_USAGE_FILE',
-        'CURSOR_API_KEY', 'COMPOSER_API_URL',
+        'CURSOR_API_KEY', 'COMPOSER_API_URL', 'COMPOSER_MODELS', 'MODELS_1M',
     ];
     const saved = {};
     for (const k of keys) {
@@ -2044,4 +2044,619 @@ test('Comp-encoding-gzip — proxy defensively decodes a gzipped composer respon
 
     await closeProxy(proxy);
     await composer.close();
+});
+
+// ---------------------------------------------------------------------------
+// Model-list aggregation (GET /v1/models)
+// ---------------------------------------------------------------------------
+
+test('Unit — openAIModelToAnthropic maps id/created and rejects bad input', () => {
+    const proxy = requireFreshProxy({});
+    const { openAIModelToAnthropic } = proxy;
+
+    const r = openAIModelToAnthropic({ id: 'gemini-3.1-pro-preview', object: 'model', created: 1700000000 });
+    assert.equal(r.type, 'model');
+    assert.equal(r.id, 'gemini-3.1-pro-preview');
+    assert.equal(r.display_name, 'gemini-3.1-pro-preview', 'display_name surfaces the id (also the routable model)');
+    assert.equal(r.created_at, new Date(1700000000 * 1000).toISOString(), 'unix seconds -> ISO');
+
+    // Missing created -> deterministic fallback, still valid ISO.
+    const r2 = openAIModelToAnthropic({ id: 'gpt-5' });
+    assert.equal(r2.created_at, '2025-01-01T00:00:00Z');
+
+    // No usable id -> null (filtered out by caller).
+    assert.equal(openAIModelToAnthropic({}), null);
+    assert.equal(openAIModelToAnthropic(null), null);
+    assert.equal(openAIModelToAnthropic({ id: '' }), null);
+
+    closeProxy(proxy);
+});
+
+test('Unit — composerModelEntries derives display names from COMPOSER_MODELS', () => {
+    const proxy = requireFreshProxy({});
+    const { composerModelEntries } = proxy;
+
+    const def = composerModelEntries({ composerModels: 'composer-2.5' });
+    assert.equal(def.length, 1);
+    assert.equal(def[0].id, 'composer-2.5');
+    assert.equal(def[0].type, 'model');
+    assert.equal(def[0].display_name, 'Composer 2.5', 'composer-2.5 -> "Composer 2.5"');
+
+    const multi = composerModelEntries({ composerModels: 'composer-2.5, composer-3' });
+    assert.deepEqual(multi.map((m) => m.id), ['composer-2.5', 'composer-3'], 'comma list parsed, whitespace trimmed');
+    assert.equal(multi[1].display_name, 'Composer 3');
+
+    // Non composer-prefixed id falls back to the id as display_name.
+    assert.equal(composerModelEntries({ composerModels: 'weird-model' })[0].display_name, 'weird-model');
+
+    // Empty / missing -> empty list.
+    assert.deepEqual(composerModelEntries({ composerModels: '' }), []);
+    assert.deepEqual(composerModelEntries({}), []);
+
+    closeProxy(proxy);
+});
+
+test('Unit — mergeModelLists preserves order and dedupes by id', () => {
+    const proxy = requireFreshProxy({});
+    const { mergeModelLists } = proxy;
+
+    const anth = [{ id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }];
+    const lite = [{ id: 'gemini-3.1-pro-preview' }, { id: 'claude-haiku-4-5' /* dup */ }];
+    const comp = [{ id: 'composer-2.5' }];
+
+    const merged = mergeModelLists(anth, lite, comp);
+    assert.deepEqual(
+        merged.map((m) => m.id),
+        ['claude-opus-4-8', 'claude-haiku-4-5', 'gemini-3.1-pro-preview', 'composer-2.5'],
+        'Anthropic first, then LiteLLM, then Composer; later dup id dropped'
+    );
+
+    // Non-array inputs and id-less entries are ignored, never throw.
+    assert.deepEqual(mergeModelLists(null, undefined, [{ foo: 1 }, { id: 'x' }]).map((m) => m.id), ['x']);
+
+    closeProxy(proxy);
+});
+
+test('M1 — GET /v1/models merges Anthropic + LiteLLM, dedupes, scrapes quota', async () => {
+    let anthReqUrl = null;
+    let anthReqMethod = null;
+    let litellmAuth = null;
+
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        anthReqUrl = req.url;
+        anthReqMethod = req.method;
+        await bufferBody(req);
+        res.writeHead(200, {
+            'content-type': 'application/json',
+            ...makeRateLimitHeaders(42, 30, 0),
+        });
+        res.end(JSON.stringify({
+            data: [
+                { type: 'model', id: 'claude-opus-4-8', display_name: 'Claude Opus 4.8', created_at: '2026-01-01T00:00:00Z' },
+                { type: 'model', id: 'claude-haiku-4-5', display_name: 'Claude Haiku 4.5', created_at: '2025-10-01T00:00:00Z' },
+            ],
+            has_more: false,
+            first_id: 'claude-opus-4-8',
+            last_id: 'claude-haiku-4-5',
+        }));
+    });
+
+    const litellm = await mockServer(async (req, res) => {
+        litellmAuth = req.headers['authorization'];
+        // OpenAI-shaped list, including a dup of an Anthropic id that must be dropped.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            object: 'list',
+            data: [
+                { id: 'gemini-3.1-pro-preview', object: 'model', created: 1730000000, owned_by: 'litellm' },
+                { id: 'gpt-5', object: 'model', created: 1720000000, owned_by: 'litellm' },
+                { id: 'claude-haiku-4-5', object: 'model', created: 1700000000, owned_by: 'litellm' },
+            ],
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        LITELLM_URL: `http://127.0.0.1:${litellm.port}/`,
+        LITELLM_API_KEY: 'litellm-key-m1',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        method: 'GET',
+        path: '/v1/models?beta=true',
+        body: null,
+        headers: { 'authorization': 'Bearer client-m1' },
+    });
+
+    assert.equal(result.statusCode, 200, 'merged list returned 200');
+    const body = JSON.parse(result.body);
+    assert.equal(body.has_more, false, 'pagination collapsed to a single page');
+    const ids = body.data.map((m) => m.id);
+    assert.deepEqual(
+        ids,
+        ['claude-opus-4-8', 'claude-haiku-4-5', 'claude-router-gemini-3.1-pro-preview', 'claude-router-gpt-5'],
+        'Anthropic models first, LiteLLM appended (foreign ids remapped to claude-router-*), duplicate claude-haiku-4-5 dropped'
+    );
+    assert.equal(body.first_id, 'claude-opus-4-8');
+    assert.equal(body.last_id, 'claude-router-gpt-5');
+    // Every exposed id starts with claude-/anthropic- so Claude Code's dialog filter accepts it.
+    assert.ok(body.data.every((m) => /^(claude|anthropic)/i.test(m.id)), 'all exposed ids pass the ^(claude|anthropic) filter');
+    // Translated LiteLLM entry: remapped id, but display_name keeps the real model name.
+    const gemini = body.data.find((m) => m.id === 'claude-router-gemini-3.1-pro-preview');
+    assert.equal(gemini.type, 'model');
+    assert.equal(gemini.display_name, 'gemini-3.1-pro-preview', 'display_name shows the real model name, not the wrapper');
+    assert.equal(gemini.created_at, new Date(1730000000 * 1000).toISOString());
+
+    // Upstream request hygiene + quota scrape.
+    assert.match(anthReqUrl, /limit=1000/, 'Anthropic fetched with a large page');
+    assert.match(anthReqUrl, /beta=true/, 'client beta flag preserved upstream');
+    assert.equal(anthReqMethod, 'GET');
+    assert.equal(litellmAuth, 'Bearer litellm-key-m1', 'LiteLLM bearer auth sent');
+
+    await new Promise((r) => setTimeout(r, 50));
+    const usage = fs.existsSync(USAGE_FILE_TMP) ? fs.readFileSync(USAGE_FILE_TMP, 'utf8') : '';
+    assert.ok(usage.includes('5h=42%'), `quota scraped from model-list response; got: ${usage.trim()}`);
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await litellm.close();
+});
+
+test('M2 — GET /v1/models appends synthetic Composer models (litellm off)', async () => {
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json', ...makeRateLimitHeaders(5, 5, 0) });
+        res.end(JSON.stringify({
+            data: [{ type: 'model', id: 'claude-opus-4-8', display_name: 'Claude Opus 4.8', created_at: '2026-01-01T00:00:00Z' }],
+            has_more: false,
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-m2',
+        COMPOSER_API_URL: 'http://127.0.0.1:19999',
+        COMPOSER_MODELS: 'composer-2.5, composer-fast',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, { method: 'GET', path: '/v1/models', body: null });
+
+    assert.equal(result.statusCode, 200);
+    const body = JSON.parse(result.body);
+    const ids = body.data.map((m) => m.id);
+    assert.deepEqual(ids, ['claude-opus-4-8', 'claude-router-composer-2.5', 'claude-router-composer-fast'], 'Composer ids appended after Anthropic, remapped to claude-router-*');
+    assert.ok(body.data.every((m) => /^(claude|anthropic)/i.test(m.id)), 'all exposed ids pass the dialog filter');
+    const composer = body.data.find((m) => m.id === 'claude-router-composer-2.5');
+    assert.equal(composer.display_name, 'Composer 2.5', 'display_name unchanged by remap');
+    assert.equal(body.last_id, 'claude-router-composer-fast');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+});
+
+test('M3 — GET /v1/models passes through a non-2xx Anthropic response verbatim', async () => {
+    let litellmCalled = false;
+
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        await bufferBody(req);
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } }));
+    });
+
+    const litellm = await mockServer((req, res) => { litellmCalled = true; res.end('{}'); });
+
+    const proxy = requireFreshProxy({
+        LITELLM_URL: `http://127.0.0.1:${litellm.port}/`,
+        LITELLM_API_KEY: 'litellm-key-m3',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, { method: 'GET', path: '/v1/models', body: null });
+
+    assert.equal(result.statusCode, 401, 'Anthropic auth error surfaced unchanged');
+    const body = JSON.parse(result.body);
+    assert.equal(body.error.type, 'authentication_error');
+    assert.equal(litellmCalled, false, 'LiteLLM not consulted when Anthropic gate fails');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await litellm.close();
+});
+
+test('M4 — GET /v1/models tolerates a LiteLLM failure (still returns Anthropic models)', async () => {
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json', ...makeRateLimitHeaders(5, 5, 0) });
+        res.end(JSON.stringify({ data: [{ type: 'model', id: 'claude-opus-4-8', display_name: 'Claude Opus 4.8' }], has_more: false }));
+    });
+
+    const proxy = requireFreshProxy({
+        // Point LiteLLM at a closed port so the sub-fetch is refused.
+        LITELLM_URL: 'http://127.0.0.1:1/',
+        LITELLM_API_KEY: 'litellm-key-m4',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, { method: 'GET', path: '/v1/models', body: null });
+
+    assert.equal(result.statusCode, 200, 'LiteLLM failure is non-fatal');
+    const body = JSON.parse(result.body);
+    assert.deepEqual(body.data.map((m) => m.id), ['claude-opus-4-8'], 'Anthropic models still returned');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+});
+
+test('Unit — remap/demap round-trips and leaves claude/anthropic ids alone', () => {
+    const proxy = requireFreshProxy({});
+    const { remapModelId, demapModelId, remapEntries } = proxy;
+
+    // Foreign ids get wrapped, and the wrapper starts with claude- (passes the dialog filter).
+    for (const id of ['gemini-3.1-pro-preview', 'gpt-5', 'composer-2.5', 'openai/o3-mini']) {
+        const wrapped = remapModelId(id);
+        assert.ok(wrapped.startsWith('claude-'), `${wrapped} passes ^claude filter`);
+        assert.equal(demapModelId(wrapped), id, `round-trips back to ${id}`);
+    }
+
+    // claude-/anthropic-prefixed ids are already accepted -> untouched both ways.
+    for (const id of ['claude-opus-4-8', 'claude-haiku-4-5', 'anthropic/claude-sonnet-4-6']) {
+        assert.equal(remapModelId(id), id, `${id} not remapped`);
+        assert.equal(demapModelId(id), id, `${id} not demapped`);
+    }
+
+    // demap is a no-op for un-prefixed ids (real foreign id sent directly via --model).
+    assert.equal(demapModelId('gpt-5'), 'gpt-5');
+
+    // [1m] variants: prefix AND trailing [1m] are stripped back to the real id.
+    assert.equal(demapModelId('claude-router-gemini-3.1-pro-preview[1m]'), 'gemini-3.1-pro-preview');
+    assert.equal(demapModelId('claude-router-composer-2.5[1m]'), 'composer-2.5');
+    // CRITICAL: a native claude/anthropic [1m] id has no prefix -> left fully intact
+    // (genuine Anthropic 1M requests must reach Anthropic unchanged, header and all).
+    assert.equal(demapModelId('claude-opus-4-8[1m]'), 'claude-opus-4-8[1m]');
+
+    // remapEntries preserves display_name, only rewrites id.
+    const out = remapEntries([{ type: 'model', id: 'gpt-5', display_name: 'gpt-5' }]);
+    assert.equal(out[0].id, 'claude-router-gpt-5');
+    assert.equal(out[0].display_name, 'gpt-5');
+
+    closeProxy(proxy);
+});
+
+test('Unit — modelMatchesAny: exact and prefix-glob patterns', () => {
+    const proxy = requireFreshProxy({});
+    const { modelMatchesAny } = proxy;
+
+    assert.equal(modelMatchesAny('gpt-5', ['gpt-5']), true, 'exact match');
+    assert.equal(modelMatchesAny('gpt-5', ['gpt-4']), false, 'exact mismatch');
+    // `gemini*` covers every gemini id (the "all gemini models" case).
+    assert.equal(modelMatchesAny('gemini-3.1-pro-preview', ['gemini*']), true);
+    assert.equal(modelMatchesAny('gemini-3-flash-preview', ['gemini*']), true);
+    assert.equal(modelMatchesAny('GEMINI-3.1-PRO', ['gemini*']), true, 'case-insensitive');
+    assert.equal(modelMatchesAny('gpt-5', ['gemini*']), false, 'prefix does not over-match');
+    assert.equal(modelMatchesAny('composer-2.5', ['gemini*']), false, 'composer excluded by gemini* (not 1M)');
+    assert.equal(modelMatchesAny('x', []), false, 'empty patterns never match');
+
+    closeProxy(proxy);
+});
+
+test('Unit — addOneMVariants appends [1m] entries for matching patterns', () => {
+    const proxy = requireFreshProxy({});
+    const { addOneMVariants } = proxy;
+
+    const entries = [
+        { type: 'model', id: 'gemini-3.1-pro-preview', display_name: 'gemini-3.1-pro-preview' },
+        { type: 'model', id: 'gemini-3-flash-preview', display_name: 'gemini-3-flash-preview' },
+        { type: 'model', id: 'gpt-5', display_name: 'gpt-5' },
+    ];
+    // A single `gemini*` pattern marks every gemini id; gpt-5 stays base-only.
+    const out = addOneMVariants(entries, ['gemini*']);
+    assert.deepEqual(
+        out.map((m) => m.id),
+        [
+            'gemini-3.1-pro-preview', 'gemini-3.1-pro-preview[1m]',
+            'gemini-3-flash-preview', 'gemini-3-flash-preview[1m]',
+            'gpt-5',
+        ],
+        'a [1m] variant is appended right after each matching base entry; unmatched ids untouched'
+    );
+    assert.equal(out[1].display_name, 'gemini-3.1-pro-preview (1M context)');
+    assert.equal(out[1].type, 'model', 'other fields carried over');
+
+    // Empty patterns -> no variants; inputs never mutated.
+    assert.equal(addOneMVariants(entries, []).length, 3);
+    assert.equal(entries.length, 3, 'input array not mutated');
+
+    closeProxy(proxy);
+});
+
+test('Unit — withoutBeta removes one token, preserves the rest', () => {
+    const proxy = requireFreshProxy({});
+    const { withoutBeta } = proxy;
+
+    assert.equal(withoutBeta('context-1m-2025-08-07', 'context-1m-2025-08-07'), null, 'only token -> null');
+    assert.equal(withoutBeta('foo, context-1m-2025-08-07 ,bar', 'context-1m-2025-08-07'), 'foo,bar', 'middle token removed, others trimmed/kept');
+    assert.equal(withoutBeta('foo,bar', 'context-1m-2025-08-07'), 'foo,bar', 'absent token -> unchanged');
+    assert.equal(withoutBeta('CONTEXT-1M-2025-08-07', 'context-1m-2025-08-07'), null, 'case-insensitive match');
+    assert.equal(withoutBeta('', 'context-1m-2025-08-07'), null);
+    assert.equal(withoutBeta(undefined, 'context-1m-2025-08-07'), null);
+
+    closeProxy(proxy);
+});
+
+test('M5 — picking a remapped Composer model demaps to composer-2.5 and routes to Composer', async () => {
+    let composerCalled = false;
+    let composerBody = null;
+
+    const composer = await mockServer(async (req, res) => {
+        composerCalled = true;
+        composerBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-m5',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-m5',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        // The id Claude Code would send after picking the remapped dialog entry.
+        body: { model: 'claude-router-composer-2.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 },
+    });
+
+    assert.equal(result.statusCode, 200, 'request succeeded via Composer');
+    assert.equal(composerCalled, true, 'Composer backend was reached (demapped composer-2.5 matched composer-*)');
+    const sent = JSON.parse(composerBody);
+    assert.equal(sent.model, 'composer-2.5', 'underlying request carries the real composer id, not the wrapper');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+test('M6 — picking a remapped LiteLLM model demaps to the real id and routes to LiteLLM', async () => {
+    let anthropicCalled = false;
+    let litellmBody = null;
+
+    const anthropic = await mockHttpsServer((req, res) => { anthropicCalled = true; res.end('{}'); });
+
+    const litellm = await mockServer(async (req, res) => {
+        litellmBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'x', choices: [] }));
+    });
+
+    const proxy = requireFreshProxy({
+        LITELLM_URL: `http://127.0.0.1:${litellm.port}/`,
+        LITELLM_API_KEY: 'litellm-key-m6',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    proxy._state.quotaState.fiveHourPct = 5; // low quota — non-claude still goes to LiteLLM
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'claude-router-gemini-3.1-pro-preview', messages: [{ role: 'user', content: 'hi' }] },
+    });
+
+    assert.equal(result.statusCode, 200, 'request succeeded via LiteLLM');
+    assert.equal(anthropicCalled, false, 'Anthropic not called (demapped id is non-claude -> LiteLLM)');
+    const sent = JSON.parse(litellmBody);
+    assert.equal(sent.model, 'gemini-3.1-pro-preview', 'underlying request carries the real LiteLLM id, not the wrapper');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await litellm.close();
+});
+
+test('M7 — MODELS_1M adds a [1m] variant to GET /v1/models (base + variant, both filter-safe)', async () => {
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json', ...makeRateLimitHeaders(5, 5, 0) });
+        res.end(JSON.stringify({ data: [{ type: 'model', id: 'claude-opus-4-8', display_name: 'Claude Opus 4.8' }], has_more: false }));
+    });
+
+    const litellm = await mockServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [
+            { id: 'gemini-3.1-pro-preview', object: 'model', created: 1730000000 },
+            { id: 'gpt-5', object: 'model', created: 1720000000 },
+        ] }));
+    });
+
+    const proxy = requireFreshProxy({
+        LITELLM_URL: `http://127.0.0.1:${litellm.port}/`,
+        LITELLM_API_KEY: 'litellm-key-m7',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        MODELS_1M: 'gemini*', // prefix glob: every gemini id gets a 1M variant, gpt-5 does not
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, { method: 'GET', path: '/v1/models', body: null });
+    assert.equal(result.statusCode, 200);
+    const body = JSON.parse(result.body);
+    const ids = body.data.map((m) => m.id);
+
+    assert.deepEqual(
+        ids,
+        [
+            'claude-opus-4-8',
+            'claude-router-gemini-3.1-pro-preview',
+            'claude-router-gemini-3.1-pro-preview[1m]',
+            'claude-router-gpt-5',
+        ],
+        'gemini gets base + [1m] variant; gpt-5 (not listed) gets base only'
+    );
+    // Both gemini entries and the variant still satisfy the dialog id filter.
+    assert.ok(body.data.every((m) => /^(claude|anthropic)/i.test(m.id)), 'every id (incl. [1m] variant) passes ^(claude|anthropic)');
+    const variant = body.data.find((m) => m.id === 'claude-router-gemini-3.1-pro-preview[1m]');
+    assert.equal(variant.display_name, 'gemini-3.1-pro-preview (1M context)');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await litellm.close();
+});
+
+test('M8 — picking a [1m] LiteLLM variant demaps the suffix and strips the context-1m beta', async () => {
+    let litellmBody = null;
+    let litellmBeta;
+
+    const anthropic = await mockHttpsServer((req, res) => { res.end('{}'); });
+
+    const litellm = await mockServer(async (req, res) => {
+        litellmBeta = req.headers['anthropic-beta']; // capture what survived
+        litellmBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'x', choices: [] }));
+    });
+
+    const proxy = requireFreshProxy({
+        LITELLM_URL: `http://127.0.0.1:${litellm.port}/`,
+        LITELLM_API_KEY: 'litellm-key-m8',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    proxy._state.quotaState.fiveHourPct = 5;
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'claude-router-gemini-3.1-pro-preview[1m]', messages: [{ role: 'user', content: 'hi' }] },
+        // Claude Code adds the context-1m beta whenever the chosen name carries [1m].
+        headers: { 'anthropic-beta': 'context-1m-2025-08-07,fine-grained-tool-streaming-2025-05-14' },
+    });
+
+    assert.equal(result.statusCode, 200);
+    const sent = JSON.parse(litellmBody);
+    assert.equal(sent.model, 'gemini-3.1-pro-preview', 'prefix AND [1m] stripped before forwarding');
+    assert.ok(!/context-1m-2025-08-07/.test(litellmBeta || ''), 'context-1m beta stripped from the LiteLLM request');
+    assert.match(litellmBeta || '', /fine-grained-tool-streaming/, 'unrelated betas preserved');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    await litellm.close();
+});
+
+test('M9 — picking a [1m] Composer variant routes to Composer with real id and no context-1m beta', async () => {
+    let composerBeta;
+    let composerBody = null;
+
+    const composer = await mockServer(async (req, res) => {
+        composerBeta = req.headers['anthropic-beta'];
+        composerBody = await bufferBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'c', choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }));
+    });
+
+    const proxy = requireFreshProxy({
+        CURSOR_API_KEY: 'cursor-m9',
+        COMPOSER_API_URL: `http://127.0.0.1:${composer.port}`,
+        ANTHROPIC_HOST_OVERRIDE: '127.0.0.1:19999',
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    const proxyPort = await listenProxy(proxy);
+
+    const result = await proxyRequest(proxyPort, {
+        body: { model: 'claude-router-composer-2.5[1m]', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 },
+        headers: { 'anthropic-beta': 'context-1m-2025-08-07' },
+    });
+
+    assert.equal(result.statusCode, 200);
+    const sent = JSON.parse(composerBody);
+    assert.equal(sent.model, 'composer-2.5', 'Composer receives the real id, [1m] stripped');
+    assert.ok(!/context-1m-2025-08-07/.test(composerBeta || ''), 'context-1m beta not forwarded to Composer');
+
+    await closeProxy(proxy);
+    await composer.close();
+});
+
+test('M10 — native claude [1m] request is forwarded to Anthropic untouched (model + beta intact)', async () => {
+    let anthModel = null;
+    let anthBeta;
+
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        anthBeta = req.headers['anthropic-beta'];
+        anthModel = JSON.parse(await bufferBody(req)).model;
+        res.writeHead(200, { 'content-type': 'application/json', ...makeRateLimitHeaders(5, 5, 0) });
+        res.end(JSON.stringify({ type: 'message', content: [] }));
+    });
+
+    const proxy = requireFreshProxy({
+        // Feature on so the body-inspection path runs (and could, incorrectly, demap).
+        LITELLM_URL: 'http://127.0.0.1:19999/',
+        LITELLM_API_KEY: 'k',
+        LITELLM_FALLBACK_OPUS: 'opus-fb',
+        LITELLM_FALLBACK_SONNET: 'sonnet-fb',
+        LITELLM_FALLBACK_HAIKU: 'haiku-fb',
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+        PROBE_INTERVAL_MS: '999999',
+    });
+
+    proxy._state.quotaState.fiveHourPct = 0; // below threshold -> Anthropic
+
+    const proxyPort = await listenProxy(proxy);
+
+    await proxyRequest(proxyPort, {
+        body: { model: 'claude-opus-4-8[1m]', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 },
+        headers: { 'anthropic-beta': 'context-1m-2025-08-07' },
+    });
+
+    assert.equal(anthModel, 'claude-opus-4-8[1m]', 'native [1m] model id NOT stripped (no claude-router- prefix)');
+    assert.match(anthBeta || '', /context-1m-2025-08-07/, 'native 1M beta header preserved to Anthropic');
+
+    await closeProxy(proxy);
+    await anthropic.close();
 });

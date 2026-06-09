@@ -42,6 +42,27 @@ const HOP_BY_HOP_STATIC = new Set([
 
 const BODY_BEARING_PATHS = new Set(['/v1/messages', '/v1/messages/count_tokens']);
 
+// GET on this exact path (query stripped) is intercepted and answered with a merged
+// model list aggregated across every backend the router knows (Anthropic + LiteLLM +
+// Composer). Anything else under /v1/models/* (e.g. retrieve by id) is left to passthrough.
+const MODELS_LIST_PATH = '/v1/models';
+const MODELS_FETCH_TIMEOUT_MS = 10000; // per-upstream cap for the models-list fan-out
+
+// Reserved namespace for foreign (LiteLLM / Composer) model ids surfaced in the
+// merged GET /v1/models list. Claude Code's model-selection dialog only accepts ids
+// matching /^(claude|anthropic)/i, so foreign ids are exposed wrapped in this prefix
+// (which begins with `claude-`) and demapped back to the real id on the inbound
+// request before routing. Anthropic never ships a model under this prefix.
+const REMAP_PREFIX = 'claude-router-';
+
+// Claude Code reads the 1M context window off a literal `[1m]` suffix in the model
+// name (regex /\[1m\]/i) and, when present, also adds this beta header to the request.
+// We can therefore offer a 1M variant of a foreign model by exposing `<id>[1m]` — but
+// the suffix must be stripped back off on the inbound request (Composer/LiteLLM don't
+// understand it), and the beta header must NOT be forwarded to a non-Anthropic backend.
+const ONE_M_SUFFIX = '[1m]';
+const ONE_M_BETA = 'context-1m-2025-08-07';
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -166,6 +187,16 @@ const config = {
     // Composer 2.5 backend (opt-in, independent of litellm). Enabled iff CURSOR_API_KEY set.
     composerApiUrl: process.env.COMPOSER_API_URL || 'https://cursor-api.standardagents.ai',
     cursorApiKey: process.env.CURSOR_API_KEY || '',
+    // Comma-separated composer model ids surfaced in the GET /v1/models aggregation.
+    // These are synthetic (Composer exposes no Anthropic-shaped model list) — they let the
+    // model-selection dialog offer Composer alongside Anthropic + LiteLLM models. The ids
+    // must match the composer-* routing pattern so a picked id round-trips to forwardToComposer.
+    composerModels: process.env.COMPOSER_MODELS || 'composer-2.5',
+    // Comma-separated REAL model ids (LiteLLM or Composer, as they route — i.e. post-demap)
+    // that should ALSO be offered as a `[1m]` 1M-context variant in GET /v1/models. Opt-in:
+    // only models whose backend genuinely supports a 1M window belong here, since the suffix
+    // makes Claude Code treat the model as 1M-token locally. Default empty (no 1M variants).
+    models1m: process.env.MODELS_1M || '',
 };
 
 const FEATURE_ENABLED = !!config.litellmUrl;
@@ -368,6 +399,155 @@ function mapFinishReason(fr) {
 
 function randomMsgId() {
     return 'msg_' + Math.random().toString(36).slice(2, 14);
+}
+
+// ---------------------------------------------------------------------------
+// Model-list aggregation (GET /v1/models) — pure helpers
+// Translate foreign model descriptors into the Anthropic Models API `ModelInfo`
+// shape so a single merged list can be returned to the client. Pure: no I/O.
+// ---------------------------------------------------------------------------
+
+// remapModelId(id) — wrap a foreign model id so it passes Claude Code's
+// /^(claude|anthropic)/i dialog filter. Ids that already start with claude/anthropic
+// are returned unchanged (they pass the filter and their routing is already meaningful);
+// everything else is prefixed with REMAP_PREFIX. Inverse of demapModelId.
+function remapModelId(id) {
+    if (typeof id !== 'string' || id.length === 0) return id;
+    if (/^(claude|anthropic)/i.test(id)) return id;
+    return REMAP_PREFIX + id;
+}
+
+// demapModelId(name) — recover the real underlying model id from a remapped name.
+// Strips the REMAP_PREFIX and, if present, the trailing `[1m]` 1M-context marker that
+// the dialog adds to the id (the real backend model carries neither). ONLY touches ids
+// in our claude-router-* namespace — a native `claude-opus-4-8[1m]` has no prefix and is
+// returned untouched, so genuine Anthropic 1M requests are never altered. No-op for any
+// name that was never remapped, so it is always safe to call.
+function demapModelId(name) {
+    if (typeof name !== 'string' || !name.startsWith(REMAP_PREFIX)) return name;
+    let real = name.slice(REMAP_PREFIX.length);
+    if (real.toLowerCase().endsWith(ONE_M_SUFFIX)) real = real.slice(0, -ONE_M_SUFFIX.length);
+    return real;
+}
+
+// modelMatchesAny(id, patterns) — case-insensitive match of a model id against a list
+// of MODELS_1M patterns. A pattern ending in `*` is a prefix match (e.g. `gemini*`
+// matches every gemini-* id); otherwise it is an exact match. Lets "all gemini models"
+// be expressed as a single `gemini*` token without enumerating each id.
+function modelMatchesAny(id, patterns) {
+    if (typeof id !== 'string' || !Array.isArray(patterns)) return false;
+    const a = id.toLowerCase();
+    for (const raw of patterns) {
+        if (typeof raw !== 'string' || !raw) continue;
+        const p = raw.toLowerCase();
+        if (p.endsWith('*') ? a.startsWith(p.slice(0, -1)) : a === p) return true;
+    }
+    return false;
+}
+
+// addOneMVariants(entries, oneMPatterns) — for each entry whose (real) id matches a
+// MODELS_1M pattern, append an extra entry carrying the `[1m]` suffix so Claude Code
+// offers a 1M-context variant in the dialog. Operates on real-id entries (before
+// remapping). The variant's display_name gets a "(1M context)" tag. Never mutates inputs.
+function addOneMVariants(entries, oneMPatterns) {
+    if (!Array.isArray(entries)) return [];
+    const out = [];
+    for (const e of entries) {
+        out.push(e);
+        if (e && typeof e.id === 'string' && modelMatchesAny(e.id, oneMPatterns)) {
+            out.push({
+                ...e,
+                id: e.id + ONE_M_SUFFIX,
+                display_name: `${e.display_name || e.id} (1M context)`,
+            });
+        }
+    }
+    return out;
+}
+
+// withoutBeta(headerValue, token) — remove one beta token from a comma-separated
+// `anthropic-beta` header value (case-insensitive), preserving the rest. Returns the
+// new value, or null when nothing remains (caller deletes the header). Pure.
+function withoutBeta(headerValue, token) {
+    if (typeof headerValue !== 'string' || !headerValue) return null;
+    const kept = headerValue
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((t) => t.toLowerCase() !== token.toLowerCase());
+    return kept.length ? kept.join(',') : null;
+}
+
+// remapEntries(entries) — return copies of ModelInfo entries with their `id` remapped
+// for dialog exposure. `display_name` is left untouched so the picker still shows the
+// real, human-recognizable model name. Never mutates the inputs.
+function remapEntries(entries) {
+    if (!Array.isArray(entries)) return [];
+    return entries.map((e) => (e && typeof e.id === 'string' ? { ...e, id: remapModelId(e.id) } : e));
+}
+
+// openAIModelToAnthropic(m) — map one OpenAI/LiteLLM `/v1/models` entry to an
+// Anthropic ModelInfo. LiteLLM returns OpenAI-shaped objects: { id, object:'model',
+// created (unix seconds), owned_by }. Returns null when there is no usable id.
+function openAIModelToAnthropic(m) {
+    if (!m || typeof m.id !== 'string' || m.id.length === 0) return null;
+    let createdAt = '2025-01-01T00:00:00Z';
+    if (typeof m.created === 'number' && Number.isFinite(m.created)) {
+        // OpenAI `created` is unix seconds; ms = *1000. Guard against absurd values.
+        try {
+            const d = new Date(m.created * 1000);
+            if (!isNaN(d.getTime())) createdAt = d.toISOString();
+        } catch { /* keep default */ }
+    }
+    return {
+        type: 'model',
+        id: m.id,
+        // No human label is available from the OpenAI list shape — surface the id,
+        // which is also exactly what the client must send back as `model`.
+        display_name: m.id,
+        created_at: createdAt,
+    };
+}
+
+// composerModelEntries(cfg) — synthesize Anthropic ModelInfo entries for Composer.
+// Composer exposes no Anthropic-shaped model list, so the ids come from config
+// (COMPOSER_MODELS, comma-separated). Ids must match the composer-* routing pattern.
+function composerModelEntries(cfg) {
+    const raw = (cfg && cfg.composerModels) || '';
+    return raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((id) => {
+            // "composer-2.5" -> "Composer 2.5"; anything else falls back to the id.
+            let displayName = id;
+            const m = /^composer[-/](.+)$/i.exec(id);
+            if (m) displayName = `Composer ${m[1]}`;
+            return {
+                type: 'model',
+                id,
+                display_name: displayName,
+                created_at: '2025-01-01T00:00:00Z',
+            };
+        });
+}
+
+// mergeModelLists(anthropicData, litellmData, composerData) — concatenate the three
+// sources in priority order (Anthropic first, then LiteLLM, then Composer), dropping
+// later entries whose id was already seen. Inputs are arrays of ModelInfo objects.
+// Returns a fresh array; never mutates inputs.
+function mergeModelLists(anthropicData, litellmData, composerData) {
+    const out = [];
+    const seen = new Set();
+    for (const list of [anthropicData, litellmData, composerData]) {
+        if (!Array.isArray(list)) continue;
+        for (const entry of list) {
+            if (!entry || typeof entry.id !== 'string' || seen.has(entry.id)) continue;
+            seen.add(entry.id);
+            out.push(entry);
+        }
+    }
+    return out;
 }
 
 // anthropicToOpenAIRequest(parsed) — translate a parsed Anthropic Messages request body
@@ -1008,6 +1188,156 @@ function forwardToComposer(clientReq, clientRes, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Model-list aggregation (GET /v1/models) — I/O
+// ---------------------------------------------------------------------------
+
+// fetchJsonOnce(requester, options) — issue a bodyless GET and buffer the full
+// response. Resolves { status, headers, bodyBuf } (decompression is the caller's
+// concern). Rejects only on transport error/timeout. `options.timeout` arms the
+// socket timeout; we destroy on fire so the promise rejects rather than hangs.
+function fetchJsonOnce(requester, options) {
+    return new Promise((resolve, reject) => {
+        const req = requester.request(options, (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, bodyBuf: Buffer.concat(chunks) }));
+            res.on('error', reject);
+        });
+        req.on('timeout', () => req.destroy(new Error('models fetch timed out')));
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+// handleModelsList — intercept GET /v1/models and answer with a list merged across
+// every backend the router knows. Anthropic is the source of truth (and the auth
+// gate): on a non-2xx Anthropic response we pass it through verbatim so 401/403/etc.
+// surface unchanged. On success we append translated LiteLLM models (when enabled)
+// and synthetic Composer models (when enabled), de-duplicated by id.
+async function handleModelsList(clientReq, clientRes) {
+    // --- 1. Anthropic upstream (always) ---------------------------------------
+    const hostHeader = config.anthropicPort === 443
+        ? config.anthropicHost
+        : `${config.anthropicHost}:${config.anthropicPort}`;
+
+    // Preserve the client's `beta` flag but force a large page so we get the full
+    // set in one shot (we collapse pagination by returning has_more:false below).
+    let beta = false;
+    try {
+        const q = new URL(clientReq.url, 'http://placeholder').searchParams;
+        beta = q.get('beta') === 'true';
+    } catch { /* malformed query — treat as no beta */ }
+    const anthPath = `/v1/models?limit=1000${beta ? '&beta=true' : ''}`;
+
+    const anthHeaders = { ...stripHopByHop(clientReq.headers), host: hostHeader, 'accept-encoding': 'identity' };
+    delete anthHeaders['content-length']; // GET carries no body
+
+    let anth;
+    try {
+        anth = await fetchJsonOnce(https, {
+            hostname: config.anthropicHost,
+            port: config.anthropicPort,
+            path: anthPath,
+            method: 'GET',
+            headers: anthHeaders,
+            timeout: MODELS_FETCH_TIMEOUT_MS,
+        });
+    } catch (err) {
+        console.error('[proxy] models-list: Anthropic fetch failed:', err.message);
+        if (!clientRes.headersSent) clientRes.writeHead(502, { 'content-type': 'application/json' });
+        return clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'models list: anthropic fetch failed' } }));
+    }
+
+    // Scrape rate-limit headers from this real Anthropic response (same as any other
+    // Anthropic call) so quota visibility / mode flips keep working off model-list traffic.
+    writeUsageFile(anth.headers);
+
+    const anthBody = decompressBody(anth.bodyBuf, anth.headers['content-encoding']);
+
+    // Non-2xx → pass through verbatim (preserve auth errors etc.).
+    if (anth.status < 200 || anth.status >= 300) {
+        const passHeaders = stripHopByHop(anth.headers);
+        passHeaders['content-length'] = Buffer.byteLength(anthBody);
+        if (!clientRes.headersSent) clientRes.writeHead(anth.status, passHeaders);
+        return clientRes.end(anthBody);
+    }
+
+    let anthJson = null;
+    try {
+        anthJson = JSON.parse(anthBody.toString('utf8'));
+    } catch {
+        console.warn('[proxy] models-list: Anthropic returned 2xx with unparseable body — continuing with extra sources only');
+    }
+    const anthropicData = anthJson && Array.isArray(anthJson.data) ? anthJson.data : [];
+
+    // MODELS_1M patterns (exact id or `prefix*`) whose matching models also get a
+    // [1m] 1M-context variant offered.
+    const oneMPatterns = config.models1m.split(',').map((s) => s.trim()).filter(Boolean);
+
+    // --- 2. LiteLLM upstream (when enabled) -----------------------------------
+    let litellmData = [];
+    if (FEATURE_ENABLED) {
+        try {
+            const requester = litellmParsed.protocol === 'https:' ? https : http;
+            const ll = await fetchJsonOnce(requester, {
+                hostname: litellmParsed.hostname,
+                port: litellmParsed.port,
+                path: '/v1/models',
+                method: 'GET',
+                headers: {
+                    host: litellmParsed.hostHeader,
+                    authorization: `Bearer ${config.litellmApiKey}`,
+                    accept: 'application/json',
+                    'accept-encoding': 'identity',
+                },
+                timeout: MODELS_FETCH_TIMEOUT_MS,
+            });
+            if (ll.status >= 200 && ll.status < 300) {
+                const llBody = decompressBody(ll.bodyBuf, ll.headers['content-encoding']);
+                const llJson = JSON.parse(llBody.toString('utf8'));
+                const items = Array.isArray(llJson && llJson.data) ? llJson.data : [];
+                // Translate → add opt-in [1m] variants (on real ids) → remap ids into the
+                // claude-router-* namespace so the dialog filter accepts them. The real id
+                // (and any [1m] suffix) is recovered on the inbound request.
+                const real = addOneMVariants(items.map(openAIModelToAnthropic).filter(Boolean), oneMPatterns);
+                litellmData = remapEntries(real);
+            } else {
+                console.warn(`[proxy] models-list: LiteLLM /v1/models returned ${ll.status} — skipping LiteLLM models`);
+            }
+        } catch (err) {
+            // Non-fatal: the dialog still gets Anthropic (+ Composer) models.
+            console.warn('[proxy] models-list: LiteLLM fetch failed, skipping LiteLLM models:', err.message);
+        }
+    }
+
+    // --- 3. Composer (synthetic, when enabled) --------------------------------
+    const composerData = COMPOSER_ENABLED
+        ? remapEntries(addOneMVariants(composerModelEntries(config), oneMPatterns))
+        : [];
+
+    // --- 4. Merge + respond ----------------------------------------------------
+    const merged = mergeModelLists(anthropicData, litellmData, composerData);
+    const out = JSON.stringify({
+        data: merged,
+        has_more: false,
+        first_id: merged.length ? merged[0].id : null,
+        last_id: merged.length ? merged[merged.length - 1].id : null,
+    });
+
+    if (FEATURE_ENABLED || COMPOSER_ENABLED) {
+        console.log(`[proxy] models-list: anthropic=${anthropicData.length} litellm=${litellmData.length} composer=${composerData.length} merged=${merged.length}`);
+    }
+
+    if (!clientRes.headersSent) {
+        clientRes.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(out),
+        });
+    }
+    clientRes.end(out);
+}
+
+// ---------------------------------------------------------------------------
 // Body buffering + routing
 // ---------------------------------------------------------------------------
 
@@ -1057,6 +1387,26 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
             captureUsage: true,
             reason: 'parse-failed-fail-safe',
         });
+    }
+
+    // Demap: if the client selected a foreign model from the dialog, its `model` carries
+    // the claude-router-* wrapper (see remapModelId). Recover the real id and rewrite the
+    // body so every downstream forwarder (composer / litellm) sends the underlying model.
+    // No-op for normal claude requests and for real foreign ids sent directly via --model.
+    if (parsed && typeof parsed.model === 'string' && parsed.model.startsWith(REMAP_PREFIX)) {
+        const real = demapModelId(parsed.model); // strips prefix + any trailing [1m]
+        console.log(`[proxy] demap: ${parsed.model} -> ${real}`);
+        parsed.model = real;
+        bodyBuf = rewriteModelInBody(bodyBuf, real); // re-serialize with the real id
+        // A foreign model is never an Anthropic-1M model: drop the context-1m beta header
+        // (Claude Code adds it whenever the selected name carried `[1m]`) so Composer/LiteLLM
+        // don't receive a beta they don't understand. Native claude-*[1m] requests skip this
+        // block entirely (no REMAP_PREFIX) and keep their header intact.
+        if ('anthropic-beta' in clientReq.headers) {
+            const next = withoutBeta(clientReq.headers['anthropic-beta'], ONE_M_BETA);
+            if (next === null) delete clientReq.headers['anthropic-beta'];
+            else clientReq.headers['anthropic-beta'] = next;
+        }
     }
 
     const modelName = parsed && typeof parsed.model === 'string' ? parsed.model : null;
@@ -1127,6 +1477,22 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
 
 function dispatchWithFeature(clientReq, clientRes) {
     const urlPath = (clientReq.url || '').split('?')[0];
+
+    // Model-selection dialog: aggregate models across all backends. Only intercepted
+    // when a feature is on (this function is unreachable in pure-passthrough mode), so
+    // a feature-off router still forwards GET /v1/models straight to Anthropic.
+    // handleModelsList never rejects (it try/catches internally), but guard anyway so a
+    // surprise rejection can't surface as an unhandled promise.
+    if (clientReq.method === 'GET' && urlPath === MODELS_LIST_PATH) {
+        return handleModelsList(clientReq, clientRes).catch((err) => {
+            console.error('[proxy] models-list: unexpected handler error:', err.message);
+            if (!clientRes.headersSent) {
+                clientRes.writeHead(502, { 'content-type': 'application/json' });
+            }
+            clientRes.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'models list failed' } }));
+        });
+    }
+
     const needsInspection = clientReq.method === 'POST' && BODY_BEARING_PATHS.has(urlPath);
 
     if (!needsInspection) {
@@ -1337,6 +1703,16 @@ if (require.main === module) {
         makeSSETranslator,
         flattenAnthropicText,
         mapFinishReason,
+        // Model-list aggregation helpers (pure) — test seam
+        openAIModelToAnthropic,
+        composerModelEntries,
+        mergeModelLists,
+        remapModelId,
+        demapModelId,
+        remapEntries,
+        addOneMVariants,
+        modelMatchesAny,
+        withoutBeta,
         // Composer config visibility (tests only)
         COMPOSER_ENABLED,
         _composerParsed: () => composerParsed,
