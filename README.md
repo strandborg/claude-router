@@ -189,7 +189,7 @@ The Composer feature activates only when `CURSOR_API_KEY` is set. All other vari
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `CURSOR_API_KEY` | Bearer token sent on every Composer-bound request. **Feature gate** — unset disables Composer. Obtain from Cursor Dashboard → Integrations. | unset |
-| `COMPOSER_API_URL` | Composer API base URL. **Host-only** — scheme, host, and port are used; any path component in the URL is ignored, since the fixed route `/opencodev2/v1/chat/completions` is always appended. | `https://cursor-api.standardagents.ai` |
+| `COMPOSER_API_URL` | Composer API base URL. **Host-only** — scheme, host, and port are used; any path component in the URL is ignored, since the fixed route `/opencodev2/v1/chat/completions` is always appended. | `https://api-for-cursor.standardagents.ai` |
 | `COMPOSER_MODELS` | Comma-separated Composer model ids surfaced in the merged `GET /v1/models` list (see below). Each id must match the `composer-*` routing pattern so a selected id round-trips back to Composer. | `composer-2.5` |
 
 **How to use:** Set your `CURSOR_API_KEY` from the Cursor Dashboard (Integrations section), then in Claude Code select a model name starting with `composer` — e.g. type `composer-2.5` when prompted for a model. The router translates your Anthropic Messages API request to OpenAI chat-completions format, forwards it to Composer, and translates the response back. Streaming is fully supported.

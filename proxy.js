@@ -185,7 +185,7 @@ const config = {
     anthropicHost: anthropicTarget.host,
     anthropicPort: anthropicTarget.port,
     // Composer 2.5 backend (opt-in, independent of litellm). Enabled iff CURSOR_API_KEY set.
-    composerApiUrl: process.env.COMPOSER_API_URL || 'https://cursor-api.standardagents.ai',
+    composerApiUrl: process.env.COMPOSER_API_URL || 'https://api-for-cursor.standardagents.ai',
     cursorApiKey: process.env.CURSOR_API_KEY || '',
     // Comma-separated composer model ids surfaced in the GET /v1/models aggregation.
     // These are synthetic (Composer exposes no Anthropic-shaped model list) — they let the
