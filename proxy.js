@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const zlib = require('zlib');
+const crypto = require('crypto');
 
 // Decompress a buffered upstream body per its content-encoding. We force
 // `accept-encoding: identity` toward Composer (we must read the body to translate
@@ -114,6 +115,15 @@ function parseIntEnv(raw, fallback) {
     return n;
 }
 
+// expandTilde(p) — resolve a leading `~` / `~/` to the user's home dir. Leaves any
+// other path untouched. Used so CLAUDE_CONFIG_DIRS accepts `~/.claude` etc.
+function expandTilde(p) {
+    if (typeof p !== 'string' || p.length === 0) return p;
+    if (p === '~') return os.homedir();
+    if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+    return p;
+}
+
 // classifyModel(name) → 'opus' | 'sonnet' | 'haiku' | 'non-claude' | 'unknown'
 // Case-insensitive substring match. null/undefined/non-string → 'unknown'.
 // A `claude-*` name without a recognized tier substring → 'unknown'.
@@ -197,6 +207,16 @@ const config = {
     // only models whose backend genuinely supports a 1M window belong here, since the suffix
     // makes Claude Code treat the model as 1M-token locally. Default empty (no 1M variants).
     models1m: process.env.MODELS_1M || '',
+    // Comma-separated Claude Code config dirs (the CLAUDE_CONFIG_DIR values used by the
+    // sessions that route through this proxy, e.g. `~/.claude,~/.claude2`). When set,
+    // the router tracks quota PER ACCOUNT: it reads each dir's `.credentials.json`,
+    // maps the OAuth/api token to that dir, and writes a separate `usage-status.md` into
+    // the dir whose credential matches each request's auth header. Unset → single-account
+    // behavior identical to before (one shared usage file at USAGE_FILE).
+    configDirs: (process.env.CLAUDE_CONFIG_DIRS || '')
+        .split(',')
+        .map((s) => expandTilde(s.trim()))
+        .filter(Boolean),
 };
 
 const FEATURE_ENABLED = !!config.litellmUrl;
@@ -247,15 +267,130 @@ if (COMPOSER_ENABLED) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-account identity + config-dir mapping
+// ---------------------------------------------------------------------------
+
+// Sentinel account key used when a request carries no auth, or when CLAUDE_CONFIG_DIRS
+// is unset (single-account mode). All such traffic shares one state bucket + USAGE_FILE.
+const DEFAULT_KEY = '__default__';
+
+// extractToken(authValue) — strip a leading `Bearer ` (case-insensitive) so the OAuth
+// token hashes identically whether it arrives via `authorization: Bearer <t>` (from
+// the request) or is read raw from `.credentials.json`. x-api-key values pass through.
+function extractToken(authValue) {
+    if (typeof authValue !== 'string') return '';
+    const m = /^bearer\s+(.+)$/i.exec(authValue.trim());
+    return (m ? m[1] : authValue).trim();
+}
+
+// accountKeyFromAuth(authValue) — stable short hash identifying an account by its token.
+// Empty/missing → DEFAULT_KEY. Never logs or stores the token itself.
+function accountKeyFromAuth(authValue) {
+    const tok = extractToken(authValue);
+    if (!tok) return DEFAULT_KEY;
+    return crypto.createHash('sha256').update(tok).digest('hex').slice(0, 16);
+}
+
+// Read the auth header off a request (Authorization preferred over x-api-key).
+function authFromHeaders(headers) {
+    if (headers['authorization']) return { value: headers['authorization'], sourceHeader: 'authorization' };
+    if (headers['x-api-key'])     return { value: headers['x-api-key'], sourceHeader: 'x-api-key' };
+    return null;
+}
+
+// accountKeyFromHeaders(headers) — derive the account key for an inbound request. In
+// single-account mode (CLAUDE_CONFIG_DIRS unset) ALL traffic shares DEFAULT_KEY, making
+// the proxy byte-identical to its pre-multi-account behavior; per-token keying only
+// kicks in once config dirs are configured.
+function accountKeyFromHeaders(headers) {
+    if (config.configDirs.length === 0) return DEFAULT_KEY;
+    const a = authFromHeaders(headers);
+    return a ? accountKeyFromAuth(a.value) : DEFAULT_KEY;
+}
+
+// credCache: configDir -> { mtimeMs, accountKey }. keyToDir: accountKey -> configDir.
+// Rebuilt lazily/incrementally by refreshCredMap() (mtime-gated, so it's cheap to call
+// on every cache miss). Maps each account's credential token to the dir its session uses.
+const credCache = new Map();
+const keyToDir = new Map();
+
+// refreshCredMap() — re-read `.credentials.json` from every configured dir whose file
+// mtime changed since last read, and (re)derive its account key. Per-dir try/catch keeps
+// a missing/locked/garbage creds file from being fatal. No-op when configDirs is empty.
+function refreshCredMap() {
+    for (const dir of config.configDirs) {
+        const credFile = path.join(dir, '.credentials.json');
+        let st;
+        try {
+            st = fs.statSync(credFile);
+        } catch {
+            continue; // no creds file in this dir (yet) — skip
+        }
+        const cached = credCache.get(dir);
+        if (cached && cached.mtimeMs === st.mtimeMs) continue; // unchanged
+        try {
+            const raw = JSON.parse(fs.readFileSync(credFile, 'utf8'));
+            const token = raw && raw.claudeAiOauth && raw.claudeAiOauth.accessToken;
+            if (typeof token !== 'string' || !token) {
+                credCache.set(dir, { mtimeMs: st.mtimeMs, accountKey: null });
+                continue;
+            }
+            const key = accountKeyFromAuth(token);
+            // Drop any stale key->dir entry this dir previously owned (token rotation).
+            if (cached && cached.accountKey && cached.accountKey !== key && keyToDir.get(cached.accountKey) === dir) {
+                keyToDir.delete(cached.accountKey);
+            }
+            credCache.set(dir, { mtimeMs: st.mtimeMs, accountKey: key });
+            keyToDir.set(key, dir);
+        } catch (err) {
+            console.warn(`[proxy] could not read credentials in ${dir}: ${err.message}`);
+        }
+    }
+}
+
+// resolveUsagePath(accountKey) — the usage-status.md path for an account. Maps the key to
+// its config dir (re-reading creds once on a miss, to absorb OAuth token rotation); falls
+// back to the shared USAGE_FILE when unmatched or in single-account mode. Defensively
+// replaces a symlinked target with a real file so two accounts can't alias one file.
+function resolveUsagePath(accountKey) {
+    if (config.configDirs.length === 0 || accountKey === DEFAULT_KEY) return USAGE_FILE;
+    let dir = keyToDir.get(accountKey);
+    if (!dir) {
+        refreshCredMap();
+        dir = keyToDir.get(accountKey);
+    }
+    if (!dir) return USAGE_FILE; // unknown account → shared file (back-compat)
+    const target = path.join(dir, 'usage-status.md');
+    try {
+        if (fs.lstatSync(target).isSymbolicLink()) fs.unlinkSync(target);
+    } catch { /* not present or not a symlink — nothing to undo */ }
+    return target;
+}
+
+// ---------------------------------------------------------------------------
 // Module-level mutable state
 // ---------------------------------------------------------------------------
 
-const quotaState = { fiveHourPct: 0, sevenDayPct: 0, overagePct: 0, updatedAt: 0 };
-let lastClientAuth = null; // { value, sourceHeader: 'authorization'|'x-api-key', capturedAt }
-let mode = 'anthropic';    // 'anthropic' | 'litellm'  (informational; dispatch re-derives from state)
-let probeFailures = 0;
-let probeIntervalMs = config.probeIntervalMs;
-let activeProbeTimer = null;
+// Per-account state, keyed by accountKey. Replaces the former single global quotaState /
+// lastClientAuth / mode / probe-backoff trio so concurrent accounts (e.g. a `~/.claude`
+// Max session + a `~/.claude2` session) never overwrite each other's quota or routing.
+const accounts = new Map();
+
+function getAccount(key) {
+    let a = accounts.get(key);
+    if (!a) {
+        a = {
+            quota: { fiveHourPct: 0, sevenDayPct: 0, overagePct: 0, updatedAt: 0 },
+            mode: 'anthropic',     // 'anthropic' | 'litellm'
+            lastAuth: null,        // { value, sourceHeader, capturedAt }
+            probeFailures: 0,
+            probeIntervalMs: config.probeIntervalMs,
+            probeTimer: null,
+        };
+        accounts.set(key, a);
+    }
+    return a;
+}
 
 let headersLogged = false; // log all ratelimit headers once to discover per-model pools
 let noUtilHeadersLogged = false; // log once when an Anthropic response carries no util headers
@@ -264,7 +399,11 @@ let noUtilHeadersLogged = false; // log once when an Anthropic response carries 
 // Usage file + quota mutation
 // ---------------------------------------------------------------------------
 
-function writeUsageFile(headers) {
+// writeUsageFile(headers, accountKey) — scrape the response's rate-limit headers and
+// persist that account's quota line to ITS usage-status.md (resolveUsagePath), updating
+// that account's in-memory quota + routing mode. accountKey defaults to DEFAULT_KEY so
+// single-account / no-auth traffic still works exactly as before.
+function writeUsageFile(headers, accountKey = DEFAULT_KEY) {
     // On first response, dump every anthropic-ratelimit-* header to the log so we can
     // discover whether Sonnet/Opus have separate pool headers
     if (!headersLogged) {
@@ -285,11 +424,11 @@ function writeUsageFile(headers) {
 
     if (fiveH === null && sevenD === null) {
         // Diagnostic: this is the silent stranding mode. If the probe / non-body-bearing
-        // endpoint does not include unified-utilization headers, quotaState never updates
+        // endpoint does not include unified-utilization headers, quota state never updates
         // and the proxy gets stuck in litellm mode forever. Logging once (gated like the
         // header dump) keeps recurring requests quiet but makes the situation visible.
         if (!noUtilHeadersLogged) {
-            console.warn('[proxy] writeUsageFile: response had no unified-utilization headers — quotaState not updated. Endpoint does not surface rate-limit data.');
+            console.warn('[proxy] writeUsageFile: response had no unified-utilization headers — quota state not updated. Endpoint does not surface rate-limit data.');
             noUtilHeadersLogged = true;
         }
         return;
@@ -307,67 +446,55 @@ function writeUsageFile(headers) {
     // Single line — keeps context injection cost negligible
     const content = `5h=${fiveH !== null ? fiveH + '%' : '?'}${warn5h} 7d=${sevenD !== null ? sevenD + '%' : '?'}${warn7d} overage=${overage !== null ? overage + '%' : '?'} bottleneck=${neck} (${now})\n`;
 
+    const usagePath = resolveUsagePath(accountKey);
     try {
-        fs.writeFileSync(USAGE_FILE, content, 'utf8');
+        fs.writeFileSync(usagePath, content, 'utf8');
     } catch (err) {
-        console.error(`[proxy] Failed to write ${USAGE_FILE}:`, err.message);
+        console.error(`[proxy] Failed to write ${usagePath}:`, err.message);
     }
 
-    // Update in-memory quota state (always — cost is one assignment).
+    // Update this account's in-memory quota state (always — cost is one assignment).
     // Feature-visible side effects live downstream of updateModeFromQuota, which IS gated.
-    if (fiveH !== null) quotaState.fiveHourPct = fiveH;
-    if (sevenD !== null) quotaState.sevenDayPct = sevenD;
-    if (overage !== null) quotaState.overagePct = overage;
-    quotaState.updatedAt = Date.now();
+    const quota = getAccount(accountKey).quota;
+    if (fiveH !== null) quota.fiveHourPct = fiveH;
+    if (sevenD !== null) quota.sevenDayPct = sevenD;
+    if (overage !== null) quota.overagePct = overage;
+    quota.updatedAt = Date.now();
 
-    updateModeFromQuota();
+    updateModeFromQuota(accountKey);
 }
 
-// updateModeFromQuota — gated on FEATURE_ENABLED so feature-off mode is byte-identical (Principle 2).
-function updateModeFromQuota() {
+// updateModeFromQuota(accountKey) — gated on FEATURE_ENABLED so feature-off mode is
+// byte-identical (Principle 2). Flips ONLY the given account's routing mode.
+function updateModeFromQuota(accountKey = DEFAULT_KEY) {
     if (!FEATURE_ENABLED) return;
-    const prev = mode;
-    const next = shouldRedirect(quotaState, config.thresholds, prev) ? 'litellm' : 'anthropic';
+    const acct = getAccount(accountKey);
+    const prev = acct.mode;
+    const next = shouldRedirect(acct.quota, config.thresholds, prev) ? 'litellm' : 'anthropic';
     if (next !== prev) {
-        mode = next;
-        console.log(`[proxy] mode transition: ${prev} -> ${next} (5h=${quotaState.fiveHourPct}%, 7d=${quotaState.sevenDayPct}%, overage=${quotaState.overagePct}%)`);
-        // If we just entered redirect mode, make sure a probe is armed.
-        if (next === 'litellm' && FEATURE_ENABLED && !activeProbeTimer) {
-            scheduleNextProbe();
+        acct.mode = next;
+        console.log(`[proxy] mode transition [${accountKey}]: ${prev} -> ${next} (5h=${acct.quota.fiveHourPct}%, 7d=${acct.quota.sevenDayPct}%, overage=${acct.quota.overagePct}%)`);
+        // If we just entered redirect mode, make sure this account's probe is armed.
+        if (next === 'litellm' && !acct.probeTimer) {
+            scheduleNextProbe(accountKey);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Client auth capture (feeds probe)
+// Client auth capture (feeds the per-account probe)
 // ---------------------------------------------------------------------------
 
+// captureClientAuth(headers) — record the inbound request's auth on its account bucket
+// so the probe loop can re-issue it. Returns the resolved accountKey. A rotated token
+// hashes to a brand-new key (fresh bucket, fresh probe backoff), so no explicit
+// rotation-reset is needed; the old bucket simply stops receiving traffic.
 function captureClientAuth(headers) {
-    let value = null;
-    let sourceHeader = null;
-    // Prefer Authorization if both exist.
-    if (headers['authorization']) {
-        value = headers['authorization'];
-        sourceHeader = 'authorization';
-    } else if (headers['x-api-key']) {
-        value = headers['x-api-key'];
-        sourceHeader = 'x-api-key';
-    }
-    if (!value) return;
-
-    const prevValue = lastClientAuth && lastClientAuth.value;
-    lastClientAuth = { value, sourceHeader, capturedAt: Date.now() };
-
-    // C4 stranded-mode reset: auth rotation invalidates backoff/probe-failure state.
-    if (FEATURE_ENABLED && prevValue !== null && prevValue !== value) {
-        probeFailures = 0;
-        probeIntervalMs = config.probeIntervalMs;
-        if (activeProbeTimer) {
-            clearTimeout(activeProbeTimer);
-            activeProbeTimer = null;
-        }
-        if (mode === 'litellm') scheduleNextProbe();
-    }
+    const a = authFromHeaders(headers);
+    if (!a) return DEFAULT_KEY;
+    const key = accountKeyFromHeaders(headers);
+    getAccount(key).lastAuth = { value: a.value, sourceHeader: a.sourceHeader, capturedAt: Date.now() };
+    return key;
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +1052,7 @@ function forwardToAnthropic(clientReq, clientRes, opts) {
     };
 
     const upstreamReq = https.request(options, (upstreamRes) => {
-        if (captureUsage) writeUsageFile(upstreamRes.headers);
+        if (captureUsage) writeUsageFile(upstreamRes.headers, accountKeyFromHeaders(clientReq.headers));
 
         const responseHeaders = stripHopByHop(upstreamRes.headers);
         clientRes.writeHead(upstreamRes.statusCode, responseHeaders);
@@ -1250,7 +1377,7 @@ async function handleModelsList(clientReq, clientRes) {
 
     // Scrape rate-limit headers from this real Anthropic response (same as any other
     // Anthropic call) so quota visibility / mode flips keep working off model-list traffic.
-    writeUsageFile(anth.headers);
+    writeUsageFile(anth.headers, accountKeyFromHeaders(clientReq.headers));
 
     const anthBody = decompressBody(anth.bodyBuf, anth.headers['content-encoding']);
 
@@ -1436,7 +1563,8 @@ function routeWithBody(clientReq, clientRes, bodyBuf) {
     // mutates quotaState unconditionally (L241-244) and shouldRedirect reads it directly, so
     // under composer-on/litellm-off a high-quota claude request would otherwise reach
     // forwardToLiteLLM at the calls below with litellmParsed === null -> crash.
-    if (FEATURE_ENABLED && shouldRedirect(quotaState, config.thresholds, mode)) {
+    const acct = getAccount(accountKeyFromHeaders(clientReq.headers));
+    if (FEATURE_ENABLED && shouldRedirect(acct.quota, config.thresholds, acct.mode)) {
         if (tier === 'unknown') {
             // Spec line 44 carve-out: forward body unchanged to LiteLLM. Only applies
             // when the body PARSED but the model name is an unknown claude-* tier (or
@@ -1519,9 +1647,12 @@ function dispatchWithFeature(clientReq, clientRes) {
 // Probe loop
 // ---------------------------------------------------------------------------
 
-function runProbe() {
+// runProbe(accountKey) — refresh ONE account's quota while it is redirected to LiteLLM,
+// re-issuing that account's own captured auth so the scrape reflects the right account.
+function runProbe(accountKey) {
     if (!FEATURE_ENABLED) return;
-    if (mode !== 'litellm') return; // OQ5: probe only when redirected.
+    const acct = getAccount(accountKey);
+    if (acct.mode !== 'litellm') return; // OQ5: probe only when redirected.
 
     const hostHeader = config.anthropicPort === 443
         ? config.anthropicHost
@@ -1533,19 +1664,19 @@ function runProbe() {
         host: hostHeader,
     };
 
-    // Auth precedence: env-supplied key > cached client auth > skip tick.
+    // Auth precedence: env-supplied key > this account's cached client auth > skip tick.
     if (config.anthropicApiKeyForProbes) {
         headers['x-api-key'] = config.anthropicApiKeyForProbes;
-    } else if (lastClientAuth) {
-        headers[lastClientAuth.sourceHeader] = lastClientAuth.value;
+    } else if (acct.lastAuth) {
+        headers[acct.lastAuth.sourceHeader] = acct.lastAuth.value;
     } else {
         return; // AC8: skip before first client req when no env-supplied key
     }
 
     // Probe target was /v1/messages/count_tokens, but empirically that endpoint does
     // not return the anthropic-ratelimit-unified-*-utilization headers. With those
-    // missing, writeUsageFile early-returns and quotaState never refreshes, leaving
-    // the proxy stranded in litellm mode. /v1/messages with max_tokens=1 reliably
+    // missing, writeUsageFile early-returns and the account's quota never refreshes,
+    // leaving it stranded in litellm mode. /v1/messages with max_tokens=1 reliably
     // returns the headers and consumes a trivial amount of quota (~1 token/probe).
     const body = JSON.stringify({
         model: config.probeModel,
@@ -1563,42 +1694,50 @@ function runProbe() {
         timeout: PROBE_TIMEOUT_MS,
     }, (res) => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-            const modeBefore = mode;
-            writeUsageFile(res.headers); // also updates quotaState + may flip mode
-            probeFailures = 0;
-            probeIntervalMs = config.probeIntervalMs;
-            console.log(`[proxy] probe: 200 5h=${quotaState.fiveHourPct}% 7d=${quotaState.sevenDayPct}% overage=${quotaState.overagePct}% mode=${modeBefore}->${mode}`);
+            const modeBefore = acct.mode;
+            writeUsageFile(res.headers, accountKey); // also updates quota + may flip mode
+            acct.probeFailures = 0;
+            acct.probeIntervalMs = config.probeIntervalMs;
+            console.log(`[proxy] probe [${accountKey}]: 200 5h=${acct.quota.fiveHourPct}% 7d=${acct.quota.sevenDayPct}% overage=${acct.quota.overagePct}% mode=${modeBefore}->${acct.mode}`);
         } else {
-            probeFailures++;
-            console.warn(`[proxy] probe: status ${res.statusCode} (failures=${probeFailures})`);
+            acct.probeFailures++;
+            console.warn(`[proxy] probe [${accountKey}]: status ${res.statusCode} (failures=${acct.probeFailures})`);
         }
         res.resume(); // drain
     });
     req.on('error', (err) => {
-        probeFailures++;
-        console.warn(`[proxy] probe: error ${err.message} (failures=${probeFailures})`);
+        acct.probeFailures++;
+        console.warn(`[proxy] probe [${accountKey}]: error ${err.message} (failures=${acct.probeFailures})`);
     });
     req.on('timeout', () => req.destroy(new Error('probe timeout')));
     req.end(body);
 }
 
-function scheduleNextProbe() {
+// scheduleNextProbe(accountKey) — arm the recurring probe timer for ONE account. The
+// timer self-reschedules while the account stays in litellm mode; once a probe flips it
+// back to anthropic, runProbe early-returns and we stop rescheduling (timer cleared).
+function scheduleNextProbe(accountKey) {
     if (!FEATURE_ENABLED) return;
-    activeProbeTimer = setTimeout(() => {
+    const acct = getAccount(accountKey);
+    acct.probeTimer = setTimeout(() => {
         try {
-            runProbe();
+            runProbe(accountKey);
         } catch (err) {
-            console.error('[proxy] probe scheduler error:', err.message);
+            console.error(`[proxy] probe scheduler error [${accountKey}]:`, err.message);
         }
-        // Backoff after the probe attempt (reset happens in runProbe on 2xx,
-        // and in captureClientAuth on auth change).
-        if (probeFailures >= 3) {
-            probeIntervalMs = Math.min(probeIntervalMs * 2, PROBE_BACKOFF_CAP_MS);
+        // Backoff after the probe attempt (reset happens in runProbe on 2xx).
+        if (acct.probeFailures >= 3) {
+            acct.probeIntervalMs = Math.min(acct.probeIntervalMs * 2, PROBE_BACKOFF_CAP_MS);
         }
-        scheduleNextProbe();
-    }, probeIntervalMs);
-    if (activeProbeTimer && typeof activeProbeTimer.unref === 'function') {
-        activeProbeTimer.unref();
+        // Stop probing once back under threshold; re-armed by updateModeFromQuota.
+        if (acct.mode === 'litellm') {
+            scheduleNextProbe(accountKey);
+        } else {
+            acct.probeTimer = null;
+        }
+    }, acct.probeIntervalMs);
+    if (acct.probeTimer && typeof acct.probeTimer.unref === 'function') {
+        acct.probeTimer.unref();
     }
 }
 
@@ -1658,13 +1797,20 @@ function logStartupWarnings() {
             console.warn(`[proxy] WARNING: ${key} unset — claude-${tier.toLowerCase()}-* requests will return 500 when redirect engages.`);
         }
     }
-    console.log('[proxy] NOTE: This proxy is single-tenant per running instance. To use multiple Anthropic credentials concurrently (e.g., personal Max + work API key), run separate proxy instances on different ports. State pollution between accounts is a known v1 limitation; per-auth-hash state is a v2 follow-up.');
+    if (config.configDirs.length === 0) {
+        console.log('[proxy] NOTE: single-account mode. Multiple Anthropic credentials sharing this instance will pollute each other\'s quota state and usage file. Set CLAUDE_CONFIG_DIRS=<dir1>,<dir2> to track quota per account and write a separate usage-status.md into each dir.');
+    }
 }
 
 function startServer() {
     server.listen(PORT, BIND, () => {
         console.log(`[proxy] Listening on ${BIND}:${PORT} -> ${config.anthropicHost}:${config.anthropicPort}`);
-        console.log(`[proxy] Writing usage to: ${USAGE_FILE}`);
+        if (config.configDirs.length > 0) {
+            refreshCredMap(); // prime the token->dir map so the first request resolves fast
+            console.log(`[proxy] multi-account: tracking ${config.configDirs.length} config dir(s); writing per-account usage-status.md (${keyToDir.size} credential(s) mapped)`);
+        } else {
+            console.log(`[proxy] Writing usage to: ${USAGE_FILE}`);
+        }
         if (FEATURE_ENABLED) {
             console.log(`[proxy] feature: litellm-fallback enabled (url=${config.litellmUrl})`);
         } else {
@@ -1675,11 +1821,18 @@ function startServer() {
             console.log(`[proxy] feature: composer enabled (url=${config.composerApiUrl})`);
         }
         logStartupWarnings();
-        if (FEATURE_ENABLED) scheduleNextProbe();
+        // Probes are armed per-account on demand (updateModeFromQuota → scheduleNextProbe)
+        // the first time an account's quota crosses a redirect threshold — nothing to arm
+        // globally at startup, since no account is in litellm mode yet.
     });
 
-    process.on('SIGINT',  () => { if (activeProbeTimer) clearTimeout(activeProbeTimer); process.exit(0); });
-    process.on('SIGTERM', () => { if (activeProbeTimer) clearTimeout(activeProbeTimer); process.exit(0); });
+    const clearAllProbes = () => {
+        for (const acct of accounts.values()) {
+            if (acct.probeTimer) clearTimeout(acct.probeTimer);
+        }
+    };
+    process.on('SIGINT',  () => { clearAllProbes(); process.exit(0); });
+    process.on('SIGTERM', () => { clearAllProbes(); process.exit(0); });
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,17 +1870,29 @@ if (require.main === module) {
         COMPOSER_ENABLED,
         _composerParsed: () => composerParsed,
         COMPOSER_ROUTE,
-        // Internal seams (tests only)
+        // Per-account identity helpers (pure) — test seam
+        extractToken,
+        accountKeyFromAuth,
+        // Internal seams (tests only). The legacy single-account accessors are backed by
+        // the DEFAULT_KEY bucket so pre-existing tests keep working unchanged.
         _state: {
-            quotaState,
-            lastClientAuth: () => lastClientAuth,
-            getMode: () => mode,
-            setMode: (m) => { mode = m; },
+            get quotaState() { return getAccount(DEFAULT_KEY).quota; },
+            lastClientAuth: () => getAccount(DEFAULT_KEY).lastAuth,
+            getMode: () => getAccount(DEFAULT_KEY).mode,
+            setMode: (m) => { getAccount(DEFAULT_KEY).mode = m; },
+            // Per-account seams
+            accounts,
+            getAccount,
+            keyToDir,
+            DEFAULT_KEY,
         },
         _config: config,
         _server: server,
         _startServer: startServer,
         _updateModeFromQuota: updateModeFromQuota,
         _captureClientAuth: captureClientAuth,
+        _refreshCredMap: refreshCredMap,
+        _resolveUsagePath: resolveUsagePath,
+        _writeUsageFile: writeUsageFile,
     };
 }
