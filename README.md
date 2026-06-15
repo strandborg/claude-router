@@ -10,7 +10,7 @@ A local HTTP router for Claude Code. Routes each request to either `api.anthropi
 
 The router has four capabilities that can be used independently:
 
-1. **Quota visibility** — always on. Forwards every request to Anthropic unchanged, scrapes the `anthropic-ratelimit-*` response headers, and writes a one-line status file at `~/.claude/usage-status.md`. Claude reads that file to know how close it is to the 5-hour, 7-day, and overage limits.
+1. **Quota visibility** — always on. Forwards every request to Anthropic unchanged, scrapes the `anthropic-ratelimit-*` response headers, and writes a one-line status file at `~/.claude/usage-status.md`. Claude reads that file to know how close it is to the 5-hour, 7-day, and overage limits. Multiple accounts sharing one router can be tracked independently — set `CLAUDE_CONFIG_DIRS` (see [Multiple accounts](#multiple-accounts)).
 
 2. **LiteLLM fallback** — opt-in via `LITELLM_URL`. When any utilization window hits a configured threshold, `claude-*` requests are redirected to a local LiteLLM instance with the body's `model` field rewritten to a tier-matched substitute (`opus`, `sonnet`, `haiku`). Non-Anthropic models (`gpt-*`, `gemini-*`, etc.) always go to LiteLLM regardless of quota, with the body forwarded as-is.
 
@@ -127,6 +127,8 @@ Description=Claude Router
 [Service]
 ExecStart=/usr/bin/node /path/to/claude-router/proxy.js
 Environment=CLAUDE_USAGE_FILE=%h/.claude/usage-status.md
+# Optional — track quota per account when multiple Claude logins share this router:
+# Environment=CLAUDE_CONFIG_DIRS=%h/.claude,%h/.claude2
 # Optional — enable LiteLLM fallback:
 # Environment=LITELLM_URL=http://localhost:4000
 # Environment=LITELLM_API_KEY=sk-...
@@ -157,9 +159,24 @@ All claude-router settings are environment variables. Only `ANTHROPIC_BASE_URL` 
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `CLAUDE_USAGE_FILE` | Path to the usage status file Claude reads. | `~/.claude/usage-status.md` |
+| `CLAUDE_USAGE_FILE` | Path to the usage status file Claude reads (single-account / fallback). | `~/.claude/usage-status.md` |
+| `CLAUDE_CONFIG_DIRS` | Comma-separated list of Claude Code config dirs to track **per account** (e.g. `~/.claude,~/.claude2`). See [Multiple accounts](#multiple-accounts). | unset (single-account) |
 | `PORT` | TCP port the proxy listens on. | `4080` |
 | `BIND` | Bind address. | `127.0.0.1` |
+
+#### Multiple accounts
+
+If you run more than one Claude account through the **same** router — e.g. several Claude Code sessions where some set `CLAUDE_CONFIG_DIR=~/.claude` and others `CLAUDE_CONFIG_DIR=~/.claude2` — set `CLAUDE_CONFIG_DIRS` to the list of those dirs:
+
+```bash
+export CLAUDE_CONFIG_DIRS=~/.claude,~/.claude2
+```
+
+With this set, the router identifies each request by its auth token, reads each dir's `.credentials.json` to map that token to its config dir, and writes a **separate** `usage-status.md` into each dir. Each account's 5h/7d/overage quota — and its LiteLLM-fallback routing — is tracked independently, so one account hitting its limit never overwrites the other's usage file or redirects the other's traffic. Token rotation (OAuth refresh) is handled automatically: the credentials file is re-read on the next request.
+
+Without `CLAUDE_CONFIG_DIRS`, the router stays single-account: all traffic shares one `quotaState` and one `CLAUDE_USAGE_FILE`, and concurrent accounts will pollute each other's numbers.
+
+> **Remove any symlink first.** If `~/.claude2/usage-status.md` is a symlink to `~/.claude/usage-status.md`, both accounts alias one file. The router defensively replaces a symlinked target with a real file on first write, but it's cleanest to `rm ~/.claude2/usage-status.md` once so each dir owns a real file. (`.credentials.json` must stay a separate real file per dir — that's what distinguishes the accounts.)
 
 ### LiteLLM fallback (opt-in)
 

@@ -159,6 +159,7 @@ function requireFreshProxy(env = {}) {
         'REDIRECT_AT_OVERAGE_PCT', 'PROBE_INTERVAL_MS', 'MAX_BUFFER_BYTES',
         'ANTHROPIC_HOST_OVERRIDE', 'ANTHROPIC_API_KEY_FOR_PROBES', 'CLAUDE_USAGE_FILE',
         'CURSOR_API_KEY', 'COMPOSER_API_URL', 'COMPOSER_MODELS', 'MODELS_1M',
+        'CLAUDE_CONFIG_DIRS',
     ];
     const saved = {};
     for (const k of keys) {
@@ -2659,4 +2660,140 @@ test('M10 — native claude [1m] request is forwarded to Anthropic untouched (mo
 
     await closeProxy(proxy);
     await anthropic.close();
+});
+
+// ---------------------------------------------------------------------------
+// Multi-account (CLAUDE_CONFIG_DIRS) — per-account quota tracking
+// ---------------------------------------------------------------------------
+
+test('Unit — extractToken strips Bearer and passes raw values through', () => {
+    const { extractToken } = requireFreshProxy({});
+    assert.equal(extractToken('Bearer abc123'), 'abc123', 'strips "Bearer "');
+    assert.equal(extractToken('bearer  xyz'), 'xyz', 'case-insensitive + trims');
+    assert.equal(extractToken('sk-ant-raw-key'), 'sk-ant-raw-key', 'raw x-api-key passes through');
+    assert.equal(extractToken(''), '', 'empty -> empty');
+    assert.equal(extractToken(undefined), '', 'non-string -> empty');
+});
+
+test('Unit — accountKeyFromAuth is stable, distinct, and Bearer-invariant', () => {
+    const { accountKeyFromAuth } = requireFreshProxy({});
+    const a1 = accountKeyFromAuth('Bearer token-A');
+    const a2 = accountKeyFromAuth('Bearer token-A');
+    const b = accountKeyFromAuth('Bearer token-B');
+    assert.equal(a1, a2, 'same token -> same key (stable)');
+    assert.notEqual(a1, b, 'different tokens -> different keys');
+    // A token read raw from .credentials.json must hash identically to the same token
+    // arriving as "Bearer <token>" on a request.
+    assert.equal(accountKeyFromAuth('token-A'), a1, 'raw token hashes same as Bearer form');
+    assert.equal(accountKeyFromAuth(''), '__default__', 'empty -> DEFAULT_KEY');
+    assert.equal(accountKeyFromAuth(null), '__default__', 'null -> DEFAULT_KEY');
+});
+
+test('Unit — per-account quota state is isolated', () => {
+    const proxy = requireFreshProxy({ CLAUDE_USAGE_FILE: USAGE_FILE_TMP });
+    const keyA = proxy.accountKeyFromAuth('Bearer acct-A');
+    const keyB = proxy.accountKeyFromAuth('Bearer acct-B');
+    proxy._writeUsageFile(makeRateLimitHeaders(11, 22, 0), keyA);
+    proxy._writeUsageFile(makeRateLimitHeaders(77, 88, 5), keyB);
+    assert.equal(proxy._state.getAccount(keyA).quota.fiveHourPct, 11, 'acct A 5h isolated');
+    assert.equal(proxy._state.getAccount(keyA).quota.sevenDayPct, 22, 'acct A 7d isolated');
+    assert.equal(proxy._state.getAccount(keyB).quota.fiveHourPct, 77, 'acct B 5h isolated');
+    assert.equal(proxy._state.getAccount(keyB).quota.overagePct, 5, 'acct B overage isolated');
+});
+
+test('Unit — resolveUsagePath maps tokens to their config dir and falls back', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-cfgdirs-'));
+    const dirA = path.join(base, '.claude');
+    const dirB = path.join(base, '.claude2');
+    fs.mkdirSync(dirA); fs.mkdirSync(dirB);
+    fs.writeFileSync(path.join(dirA, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'tok-A' } }));
+    fs.writeFileSync(path.join(dirB, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'tok-B' } }));
+
+    const proxy = requireFreshProxy({
+        CLAUDE_CONFIG_DIRS: `${dirA},${dirB}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+    });
+    proxy._refreshCredMap();
+    const keyA = proxy.accountKeyFromAuth('tok-A');
+    const keyB = proxy.accountKeyFromAuth('tok-B');
+    assert.equal(proxy._resolveUsagePath(keyA), path.join(dirA, 'usage-status.md'), 'tok-A -> dirA');
+    assert.equal(proxy._resolveUsagePath(keyB), path.join(dirB, 'usage-status.md'), 'tok-B -> dirB');
+    assert.equal(proxy._resolveUsagePath('unknown-key'), USAGE_FILE_TMP, 'unknown key -> fallback USAGE_FILE');
+
+    fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('Unit — resolveUsagePath replaces a symlinked usage file with a real path', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-symlink-'));
+    const dirA = path.join(base, '.claude');
+    const dirB = path.join(base, '.claude2');
+    fs.mkdirSync(dirA); fs.mkdirSync(dirB);
+    fs.writeFileSync(path.join(dirA, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'tok-A' } }));
+    fs.writeFileSync(path.join(dirB, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'tok-B' } }));
+    // Mirror the user's setup: .claude2/usage-status.md is a symlink into .claude.
+    fs.writeFileSync(path.join(dirA, 'usage-status.md'), 'shared\n');
+    fs.symlinkSync(path.join(dirA, 'usage-status.md'), path.join(dirB, 'usage-status.md'));
+
+    const proxy = requireFreshProxy({ CLAUDE_CONFIG_DIRS: `${dirA},${dirB}`, CLAUDE_USAGE_FILE: USAGE_FILE_TMP });
+    proxy._refreshCredMap();
+    const keyB = proxy.accountKeyFromAuth('tok-B');
+    const resolved = proxy._resolveUsagePath(keyB);
+    assert.equal(resolved, path.join(dirB, 'usage-status.md'));
+    // The symlink has been removed (the real file is created on the next write), so a
+    // subsequent write to dirB must NOT bleed into dirA.
+    assert.equal(fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink(), false, 'symlink removed');
+    fs.writeFileSync(resolved, 'B-only\n');
+    assert.equal(fs.readFileSync(path.join(dirA, 'usage-status.md'), 'utf8'), 'shared\n', 'dirA file untouched by dirB write');
+    assert.equal(fs.readFileSync(resolved, 'utf8'), 'B-only\n', 'dirB now holds its own content');
+
+    fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('Integration — two accounts write separate usage-status.md files', async () => {
+    // Mock Anthropic returns different utilization depending on which account's token
+    // arrives, so we can prove each account's numbers land in its own dir.
+    const anthropic = await mockHttpsServer(async (req, res) => {
+        await bufferBody(req);
+        const auth = req.headers['authorization'] || '';
+        const h = auth.includes('tok-A')
+            ? makeRateLimitHeaders(12, 34, 0)
+            : makeRateLimitHeaders(89, 91, 7);
+        res.writeHead(200, h);
+        res.end('{}');
+    });
+
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-twoacct-'));
+    const dirA = path.join(base, '.claude');
+    const dirB = path.join(base, '.claude2');
+    fs.mkdirSync(dirA); fs.mkdirSync(dirB);
+    fs.writeFileSync(path.join(dirA, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'tok-A' } }));
+    fs.writeFileSync(path.join(dirB, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'tok-B' } }));
+
+    const proxy = requireFreshProxy({
+        ANTHROPIC_HOST_OVERRIDE: `127.0.0.1:${anthropic.port}`,
+        CLAUDE_CONFIG_DIRS: `${dirA},${dirB}`,
+        CLAUDE_USAGE_FILE: USAGE_FILE_TMP,
+    });
+    const proxyPort = await listenProxy(proxy);
+
+    // Clear the shared fallback file (other tests in this run share USAGE_FILE_TMP) so we
+    // can prove neither account fell back to it.
+    fs.rmSync(USAGE_FILE_TMP, { force: true });
+
+    // Pure-passthrough (no LITELLM/Composer): both requests forward to Anthropic and
+    // scrape headers into their own account's usage file.
+    await proxyRequest(proxyPort, { method: 'GET', path: '/v1/messages/foo', headers: { authorization: 'Bearer tok-A' } });
+    await proxyRequest(proxyPort, { method: 'GET', path: '/v1/messages/foo', headers: { authorization: 'Bearer tok-B' } });
+    await new Promise(r => setTimeout(r, 50));
+
+    const usageA = fs.readFileSync(path.join(dirA, 'usage-status.md'), 'utf8');
+    const usageB = fs.readFileSync(path.join(dirB, 'usage-status.md'), 'utf8');
+    assert.match(usageA, /5h=12% 7d=34%/, 'account A usage file has account A numbers');
+    assert.match(usageB, /5h=89% 7d=91% overage=7%/, 'account B usage file has account B numbers');
+    // And the shared fallback file was never used for either account.
+    assert.equal(fs.existsSync(USAGE_FILE_TMP), false, 'no write to the shared fallback file');
+
+    await closeProxy(proxy);
+    await anthropic.close();
+    fs.rmSync(base, { recursive: true, force: true });
 });

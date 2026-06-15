@@ -87,7 +87,10 @@ Invoke-Nssm @('set', $ServiceName, 'AppStderr',    (Join-Path $ProjectDir 'proxy
 Invoke-Nssm @('set', $ServiceName, 'AppRotateFiles',  '1')
 Invoke-Nssm @('set', $ServiceName, 'AppRotateBytes',  '1048576')
 
-# Bake the actual user home path in — service runs as LocalSystem so os.homedir() would be wrong
+# Bake the actual user home path in — service runs as LocalSystem so os.homedir() would be wrong.
+# To track quota PER ACCOUNT when multiple Claude logins share this router, also pass
+# CLAUDE_CONFIG_DIRS (newline-separated entries in a single AppEnvironmentExtra value), e.g.:
+#   Invoke-Nssm @('set', $ServiceName, 'AppEnvironmentExtra', "CLAUDE_USAGE_FILE=$UsageFile`nCLAUDE_CONFIG_DIRS=$env:USERPROFILE\.claude,$env:USERPROFILE\.claude2")
 Invoke-Nssm @('set', $ServiceName, 'AppEnvironmentExtra', "CLAUDE_USAGE_FILE=$UsageFile")
 
 # --- User environment variable ---
